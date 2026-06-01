@@ -1,6 +1,8 @@
 from pathlib import Path
 import cv2
 from tqdm.auto import tqdm
+import numpy as np
+
 
 def extract_frames(video_dir, out_dir):
     out_dir = Path(out_dir)
