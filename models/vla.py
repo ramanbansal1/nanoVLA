@@ -164,22 +164,9 @@ class VLA(nnx.Module):
         current_action = action
         K = 4
         
-        print("\n===== Iterative Refinement Debug =====")
-        
         for k_iter in range(K):
-            print(f"\n--- Iteration {k_iter} ---")
-
-            print("current_action")
-            print("  type :", type(current_action))
-
-            if hasattr(current_action, "shape"):
-                print("  shape:", current_action.shape)
-
             # Action Tokenizer
             action_emb = self.action_tokenizer(current_action)
-            
-            print("action_emb")
-            print("  shape:", action_emb.shape)
             
             x = jnp.concatenate([obs_emb_seq, action_emb], axis=1) # [B, 1 + horizon, hidden_size]
             
@@ -210,28 +197,9 @@ class VLA(nnx.Module):
                 
             dit_out = self.dit(x=x, context=vlm_modulated, t=current_t, cos=cos, sin=sin)
             
-            print("dit_out")
-            print("  shape:", dit_out.shape)
-            
             # Decode Action Tokens
             dit_action_emb = dit_out[:, 1:, :]
-            
-            print("dit_action_emb")
-            print("  shape:", dit_action_emb.shape)
-            
             decoded_actions = self.action_tokenizer.decode(dit_action_emb)
-            
-            print("decoded_actions")
-            print("  type:", type(decoded_actions))
-            print("  batch size:", len(decoded_actions))
-        
-            print("decoded_actions[0]")
-            print("  type:", type(decoded_actions[0]))
-        
-            if hasattr(decoded_actions[0], "shape"):
-                print("  shape:", decoded_actions[0].shape)
-        
-            print("  preview:", repr(decoded_actions[0])[:200])
             
             # Update action for next iteration
             # decoded_actions is a list of numpy arrays. The tokenizer decode might return (1, horizon, dim).
@@ -247,44 +215,4 @@ class VLA(nnx.Module):
             
         return vlm_modulated, action_emb, obs_emb, dit_out, decoded_actions
 
-if __name__ == "__main__":
-    # Test the VLM class
-    vlm = VLM(dummy=True)
-    
-    # Create a dummy image in JAX
-    dummy_image = jnp.ones((3, 224, 224), dtype=jnp.uint8) * 255
-    instruction = "What is in this image?"
-    
-    print("Testing single image VLM...")
-    hidden_state = vlm(dummy_image, instruction)
-    assert hidden_state.shape == (1, 50, 576), f"Unexpected VLM shape: {hidden_state.shape}"
-    print("VLM shape is correct.")
-    
-    print("\nTesting VLA shape consistencies...")
-    rngs = nnx.Rngs(42)
-    vla = VLA(hidden_size=192, obs_dim=30, rngs=rngs, dummy=True)
-    
-    dummy_obs = jnp.zeros((1, 30))
-    dummy_act = jnp.zeros((1, 30))
-    dummy_img = jnp.zeros((1, 3, 224, 224))
-    dummy_inst = "Test instruction"
-    
-    vlm_modulated, action_emb, obs_emb, dit_out, decoded_actions = vla(
-        images=dummy_img,
-        instruction=dummy_inst,
-        observation=dummy_obs,
-        action=dummy_act
-    )
-    
-    # Check shape consistencies
-    B = 1
-    horizon = action_emb.shape[1]
-    
-    assert vlm_modulated.shape == (B, 50, 192), f"Expected (1, 50, 192), got {vlm_modulated.shape}"
-    assert action_emb.shape == (B, horizon, 192), f"Expected (1, {horizon}, 192), got {action_emb.shape}"
-    assert obs_emb.shape == (B, 192), f"Expected (1, 192), got {obs_emb.shape}"
-    assert dit_out.shape == (B, 1 + horizon, 192), f"Expected (1, {1+horizon}, 192), got {dit_out.shape}"
-    assert len(decoded_actions) == B, f"Expected {B} decoded actions, got {len(decoded_actions)}"
-    print(f"Type of decoded action: {type(decoded_actions[0])}")
-    
-    print("All VLA shape consistencies and decoded action tests passed successfully!")
+

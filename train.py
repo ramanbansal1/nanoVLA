@@ -67,14 +67,9 @@ def main():
         observation_jnp = jnp.array(batch['observation_state'].numpy())
         action_jnp = jnp.array(batch['action'].numpy())
         
-        print(f"Inputs:")
-        print(f"  Image shape: {images_jnp.shape}")
-        print(f"  Instruction: {instruction}")
-        print(f"  Observation shape: {observation_jnp.shape}")
-        print(f"  Action shape: {action_jnp.shape}")
+
         
         # Run through VLA
-        print("\nRunning through VLA...")
         vlm_modulated, action_emb, obs_emb, dit_out, decoded_actions = vla(
             images=images_jnp, 
             instruction=instruction, 
@@ -82,16 +77,6 @@ def main():
             action=action_jnp
         )
         
-        print(f"\nOutputs:")
-        print(f"  vlm_modulated shape: {vlm_modulated.shape}")
-        print(f"  action_emb shape: {action_emb.shape}")
-        print(f"  obs_emb shape: {obs_emb.shape}")
-        print(f"  dit_out shape: {dit_out.shape}")
-        
-        print(f"\nDecoded Actions:")
-        print(f"  List length (batch size): {len(decoded_actions)}")
-        print(f"  String length (first item): {len(decoded_actions[0])}")
-        print(f"  Content snippet: {repr(decoded_actions[0][:150])}...")
         break
 
 if __name__ == "__main__":
