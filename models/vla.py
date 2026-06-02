@@ -126,6 +126,7 @@ class VLA(nnx.Module):
         
         self.action_tokenizer = ActionTokenizer(hidden_size=hidden_size, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
+        self.action_head = nnx.Linear(hidden_size, self.action_tokenizer.tokenizer.vocab_size, rngs=rngs)
         
         dit_config = DiTConfig(
             dim=hidden_size,
@@ -157,62 +158,49 @@ class VLA(nnx.Module):
         # 4. Observation Projector
         obs_emb = self.obs_projector(observation)
         
+        # Compute RoPE once for all iterations
+        action_len = action_emb.shape[1]
+        num_heads = self.dit.config.num_heads
+        head_dim = self.hidden_size // num_heads
+        
+        inv_freq = 1.0 / (10000.0 ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
+        t_rope = np.arange(action_len, dtype=np.float32)
+        freqs = np.outer(t_rope, inv_freq)
+        emb = np.repeat(freqs, 2, axis=-1)
+        action_cos = jnp.array(np.cos(emb)[None, :, None, :])
+        action_sin = jnp.array(np.sin(emb)[None, :, None, :])
+        
+        # Identity RoPE (no rotation) for observation token
+        obs_cos = jnp.ones((1, 1, 1, head_dim))
+        obs_sin = jnp.zeros((1, 1, 1, head_dim))
+        
+        cos = jnp.concatenate([obs_cos, action_cos], axis=1)
+        sin = jnp.concatenate([obs_sin, action_sin], axis=1)
+        
         # 5. DiT Integration (K=4 iterations)
         B = obs_emb.shape[0]
         obs_emb_seq = obs_emb[:, None, :] # [B, 1, hidden_size]
         
-        current_action = action
+        latent = action_emb
         K = 4
         
+        if t is None:
+            current_t = jnp.zeros((B,))
+        else:
+            current_t = t
+        
         for k_iter in range(K):
-            # Action Tokenizer
-            action_emb = self.action_tokenizer(current_action)
+            x = jnp.concatenate([obs_emb_seq, latent], axis=1) # [B, 1 + horizon, hidden_size]
             
-            x = jnp.concatenate([obs_emb_seq, action_emb], axis=1) # [B, 1 + horizon, hidden_size]
-            
-            # Compute RoPE only for action tokens
-            action_len = action_emb.shape[1]
-            num_heads = self.dit.config.num_heads
-            head_dim = self.hidden_size // num_heads
-            
-            inv_freq = 1.0 / (10000.0 ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
-            t_rope = np.arange(action_len, dtype=np.float32)
-            freqs = np.outer(t_rope, inv_freq)
-            emb = np.repeat(freqs, 2, axis=-1)
-            action_cos = jnp.array(np.cos(emb)[None, :, None, :])
-            action_sin = jnp.array(np.sin(emb)[None, :, None, :])
-            
-            # Identity RoPE (no rotation) for observation token
-            obs_cos = jnp.ones((1, 1, 1, head_dim))
-            obs_sin = jnp.zeros((1, 1, 1, head_dim))
-            
-            cos = jnp.concatenate([obs_cos, action_cos], axis=1)
-            sin = jnp.concatenate([obs_sin, action_sin], axis=1)
-            
-            # Generate dummy t for forward pass if not provided
-            if t is None:
-                current_t = jnp.zeros((B,))
-            else:
-                current_t = t
-                
             dit_out = self.dit(x=x, context=vlm_modulated, t=current_t, cos=cos, sin=sin)
             
-            # Decode Action Tokens
+            # Extract refined action tokens
             dit_action_emb = dit_out[:, 1:, :]
-            decoded_actions = self.action_tokenizer.decode(dit_action_emb)
             
-            # Update action for next iteration
-            # decoded_actions is a list of numpy arrays. The tokenizer decode might return (1, horizon, dim).
-            # We need to stack them into a JAX array of shape (batch, horizon, dim)
-            stacked_actions = []
-            for a in decoded_actions:
-                arr = jnp.array(a)
-                # If the tokenizer wrapped it in an extra batch dimension, remove it
-                if arr.ndim == 3 and arr.shape[0] == 1:
-                    arr = arr[0]
-                stacked_actions.append(arr)
-            current_action = jnp.stack(stacked_actions)
+            # Refine latent directly
+            latent = latent + (dit_action_emb / K)
             
-        return vlm_modulated, action_emb, obs_emb, dit_out, decoded_actions
-
-
+        # 6. Predict Token Logits
+        logits = self.action_head(latent)
+            
+        return vlm_modulated, action_emb, obs_emb, dit_out, latent, logits

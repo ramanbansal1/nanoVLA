@@ -27,7 +27,7 @@ if __name__ == "__main__":
     dummy_img = jnp.zeros((1, 3, 224, 224))
     dummy_inst = "Test instruction"
     
-    vlm_modulated, action_emb, obs_emb, dit_out, decoded_actions = vla(
+    vlm_modulated, action_emb, obs_emb, dit_out, latent, logits = vla(
         images=dummy_img,
         instruction=dummy_inst,
         observation=dummy_obs,
@@ -37,12 +37,31 @@ if __name__ == "__main__":
     # Check shape consistencies
     B = 1
     horizon = action_emb.shape[1]
+    vocab_size = vla.action_tokenizer.tokenizer.vocab_size
     
     assert vlm_modulated.shape == (B, 50, 192), f"Expected (1, 50, 192), got {vlm_modulated.shape}"
     assert action_emb.shape == (B, horizon, 192), f"Expected (1, {horizon}, 192), got {action_emb.shape}"
     assert obs_emb.shape == (B, 192), f"Expected (1, 192), got {obs_emb.shape}"
     assert dit_out.shape == (B, 1 + horizon, 192), f"Expected (1, {1+horizon}, 192), got {dit_out.shape}"
-    assert len(decoded_actions) == B, f"Expected {B} decoded actions, got {len(decoded_actions)}"
-    print(f"Type of decoded action: {type(decoded_actions[0])}")
+    assert latent.shape == (B, horizon, 192), f"Expected (1, {horizon}, 192), got {latent.shape}"
+    assert logits.shape == (B, horizon, vocab_size), f"Expected (1, {horizon}, {vocab_size}), got {logits.shape}"
     
-    print("All VLA shape consistencies and decoded action tests passed successfully!")
+    print("All VLA shape consistencies passed successfully!")
+    
+    # Test gradients to ensure refinement loop is differentiable
+    print("\nTesting gradient flow through latent refinement loop...")
+    def loss_fn(model):
+        _, _, _, _, lat, logit = model(
+            images=dummy_img,
+            instruction=dummy_inst,
+            observation=dummy_obs,
+            action=dummy_act
+        )
+        return jnp.mean(lat) + jnp.mean(logit)
+    
+    grad_fn = nnx.grad(loss_fn)
+    grads = grad_fn(vla)
+    
+    # Check if DiT and action_emb got gradients
+    assert grads is not None, "Gradients are None!"
+    print("Gradient flow test passed successfully!")

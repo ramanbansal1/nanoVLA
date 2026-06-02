@@ -70,7 +70,7 @@ def main():
 
         
         # Run through VLA
-        vlm_modulated, action_emb, obs_emb, dit_out, decoded_actions = vla(
+        vlm_modulated, action_emb, obs_emb, dit_out, latent, logits = vla(
             images=images_jnp, 
             instruction=instruction, 
             observation=observation_jnp, 
