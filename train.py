@@ -69,15 +69,42 @@ def main():
         
 
         
+        # Generate noise and timestep for Flow Matching
+        key = jax.random.PRNGKey(42)
+        key, noise_key, t_key = jax.random.split(key, 3)
+        
+        noise = jax.random.normal(noise_key, action_jnp.shape)
+        t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
+        t_exp = t.reshape(-1, 1, 1) if action_jnp.ndim == 3 else t.reshape(-1, 1)
+        x_t = (1 - t_exp) * noise + t_exp * action_jnp
+        
         # Run through VLA
-        vlm_modulated, action_emb, obs_emb, dit_out, latent, logits = vla(
+        vlm_modulated, action_emb, obs_emb, dit_out, latent, decoded_actions = vla(
             images=images_jnp, 
             instruction=instruction, 
             observation=observation_jnp, 
-            action=action_jnp
+            action=x_t,
+            t=t
         )
         
-        break
+        clean_emb = vla.action_tokenizer(action_jnp)
+        noisy_emb = action_emb
+        
+        # Ensure clean_emb matches noisy_emb shape for valid MSE
+        target_len = noisy_emb.shape[1]
+        current_len = clean_emb.shape[1]
+        
+        if current_len > target_len:
+            clean_emb = clean_emb[:, :target_len, :]
+        elif current_len < target_len:
+            pad_width = ((0, 0), (0, target_len - current_len), (0, 0))
+            clean_emb = jnp.pad(clean_emb, pad_width)
+            
+        velocity_target = clean_emb - noisy_emb
+        predicted_velocity = latent - noisy_emb
+            
+        loss = jnp.mean((predicted_velocity - velocity_target) ** 2)
+        print(f"Flow Matching Loss: {loss}")
 
 if __name__ == "__main__":
     main()

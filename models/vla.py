@@ -126,7 +126,6 @@ class VLA(nnx.Module):
         
         self.action_tokenizer = ActionTokenizer(hidden_size=hidden_size, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
-        self.action_head = nnx.Linear(hidden_size, self.action_tokenizer.tokenizer.vocab_size, rngs=rngs)
         
         dit_config = DiTConfig(
             dim=hidden_size,
@@ -144,6 +143,8 @@ class VLA(nnx.Module):
             action_emb: shape [B, horizon, hidden_size]
             obs_emb: shape [B, hidden_size]
             dit_out: shape [B, 1 + horizon, hidden_size]
+            latent: shape [B, horizon, hidden_size]
+            decoded_actions: list of decoded action sequences
         """
         # 1. Process images and instructions via VLM
         vlm_out = self.vlm(images, instruction)
@@ -152,7 +153,7 @@ class VLA(nnx.Module):
         vlm_proj_out = self.vlm_proj(vlm_out)
         vlm_modulated = self.modulator(vlm_proj_out)
         
-        # 3. Action Tokenizer
+        # 3. Action Tokenizer (using whatever is passed as action, e.g., x_t)
         action_emb = self.action_tokenizer(action)
         
         # 4. Observation Projector
@@ -177,30 +178,27 @@ class VLA(nnx.Module):
         cos = jnp.concatenate([obs_cos, action_cos], axis=1)
         sin = jnp.concatenate([obs_sin, action_sin], axis=1)
         
-        # 5. DiT Integration (K=4 iterations)
+        # 5. DiT Integration (Predict and Refine)
         B = obs_emb.shape[0]
         obs_emb_seq = obs_emb[:, None, :] # [B, 1, hidden_size]
-        
-        latent = action_emb
-        K = 4
         
         if t is None:
             current_t = jnp.zeros((B,))
         else:
             current_t = t
+            
+        latent = action_emb
+        K = 4
         
         for k_iter in range(K):
             x = jnp.concatenate([obs_emb_seq, latent], axis=1) # [B, 1 + horizon, hidden_size]
             
             dit_out = self.dit(x=x, context=vlm_modulated, t=current_t, cos=cos, sin=sin)
             
-            # Extract refined action tokens
             dit_action_emb = dit_out[:, 1:, :]
-            
-            # Refine latent directly
             latent = latent + (dit_action_emb / K)
             
-        # 6. Predict Token Logits
-        logits = self.action_head(latent)
+        # 6. Final Decode (Only once at the end)
+        decoded_actions = self.action_tokenizer.decode(latent)
             
-        return vlm_modulated, action_emb, obs_emb, dit_out, latent, logits
+        return vlm_modulated, action_emb, obs_emb, dit_out, latent, decoded_actions
