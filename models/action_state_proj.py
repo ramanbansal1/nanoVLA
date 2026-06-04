@@ -21,13 +21,25 @@ class ActionTokenizer(nnx.Module):
         padded_token_ids = [seq + [0] * (max_len - len(seq)) for seq in token_ids]
 
         token_ids = jnp.asarray(padded_token_ids)
+        mask = (token_ids != 0)
         
         action_embed = self.action_emb(token_ids)
-        return action_embed
+        return action_embed, mask
 
-    def decode(self, action_embed):
+    def decode(self, action_embed, mask=None):
         tokens = jnp.argmax(action_embed @ self.action_emb.embedding.get_value().T, axis=-1)
-        return [self.tokenizer.decode(t) for t in tokens]
+        # Convert to numpy for iteration and masking
+        tokens = np.array(tokens)
+        if mask is not None:
+            mask = np.array(mask)
+            
+        decoded_batch = []
+        for i in range(tokens.shape[0]):
+            valid_tokens = tokens[i][mask[i]] if mask is not None else tokens[i]
+            # Wrap the 1D list in another list to indicate a batch of size 1
+            decoded = self.tokenizer.decode([valid_tokens.tolist()])
+            decoded_batch.append(decoded[0])
+        return decoded_batch
         
 
 

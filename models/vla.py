@@ -141,6 +141,7 @@ class VLA(nnx.Module):
         Returns:
             vlm_modulated: shape [B, S, hidden_size]
             action_emb: shape [B, horizon, hidden_size]
+            action_mask: shape [B, horizon]
             obs_emb: shape [B, hidden_size]
             dit_out: shape [B, 1 + horizon, hidden_size]
             latent: shape [B, horizon, hidden_size]
@@ -154,7 +155,7 @@ class VLA(nnx.Module):
         vlm_modulated = self.modulator(vlm_proj_out)
         
         # 3. Action Tokenizer (using whatever is passed as action, e.g., x_t)
-        action_emb = self.action_tokenizer(action)
+        action_emb, action_mask = self.action_tokenizer(action)
         
         # 4. Observation Projector
         obs_emb = self.obs_projector(observation)
@@ -193,12 +194,18 @@ class VLA(nnx.Module):
         for k_iter in range(K):
             x = jnp.concatenate([obs_emb_seq, latent], axis=1) # [B, 1 + horizon, hidden_size]
             
-            dit_out = self.dit(x=x, context=vlm_modulated, t=current_t, cos=cos, sin=sin)
+            # Create full mask (True for obs token, action_mask for action tokens)
+            obs_mask = jnp.ones((B, 1), dtype=jnp.bool_)
+            full_mask = jnp.concatenate([obs_mask, action_mask], axis=1)
+            # Reshape for broadcasting in self-attention: [B, 1, 1, 1 + action_len]
+            full_mask = full_mask[:, None, None, :]
+            
+            dit_out = self.dit(x=x, context=vlm_modulated, t=current_t, cos=cos, sin=sin, mask=full_mask)
             
             dit_action_emb = dit_out[:, 1:, :]
             latent = latent + (dit_action_emb / K)
             
         # 6. Final Decode (Only once at the end)
-        decoded_actions = self.action_tokenizer.decode(latent)
+        decoded_actions = self.action_tokenizer.decode(latent, mask=action_mask)
             
-        return vlm_modulated, action_emb, obs_emb, dit_out, latent, decoded_actions
+        return vlm_modulated, action_emb, action_mask, obs_emb, dit_out, latent, decoded_actions
