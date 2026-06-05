@@ -10,11 +10,189 @@ from tqdm.auto import tqdm
 import torch 
 from data.utils import build_episode_lookup, build_instruction
 
+
+
+from pathlib import Path
+
+import torch
+from PIL import Image
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
+
+
+
+class VideoDataset(Dataset):
+    """
+    Multi-dataset + multi-camera RoboCOIN dataset.
+
+    Expected folder structure:
+
+    datasets/
+    ├── G1edu-u3_pick_apple_a/
+    │   └── frames/
+    │       ├── cam_left_high/ 
+    │       ├── cam_left_wrist/
+    │       └── cam_right_wrist/
+    ├── G1edu-u3_place_apple_c/
+    │   └── frames/
+    │       ├── cam_left_high/
+    │       ├── cam_left_wrist/
+    │       └── cam_right_wrist/
+    """
+
+    def __init__(
+        self,
+        dataset,
+        datasets_root,
+        action_horizon,
+    ):
+        self.dataset = dataset
+        self.datasets_root = Path(datasets_root)
+        self.action_horizon = action_horizon
+
+        self.state_dim = len(
+            dataset[0]["observation.state"]
+        )
+
+        self.action_dim = len(
+            dataset[0]["action"]
+        )
+
+        self.episode_ranges = (
+            build_episode_lookup(dataset)
+        )
+
+        self.max_episode_len = max(
+            end - start
+            for start, end
+            in self.episode_ranges.values()
+        )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _load_images(self, row):
+
+        dataset_name = row["dataset_name"]
+
+        frames_root = (
+            self.datasets_root
+            / dataset_name
+            / "frames"
+        )
+
+        frame_name = (
+            f"{row['frame_index']:06d}.jpg"
+        )
+
+        images = {}
+
+        if not frames_root.exists():
+            raise FileNotFoundError(
+                f"Missing: {frames_root}"
+            )
+
+        has_cam_dirs = any(p.is_dir() for p in frames_root.iterdir())
+        
+        if not has_cam_dirs:
+            image_path = frames_root / frame_name
+            if image_path.exists():
+                images['default_cam'] = Image.open(image_path).convert("RGB")
+        else:
+            for cam_dir in sorted(
+                frames_root.iterdir()
+            ):
+    
+                if not cam_dir.is_dir():
+                    continue
+    
+                image_path = (
+                    cam_dir / frame_name
+                )
+    
+                if image_path.exists():
+                    images[cam_dir.name] = (
+                        Image.open(image_path)
+                        .convert("RGB")
+                    )
+
+        if len(images) == 0:
+            raise FileNotFoundError(
+                f"No images found for "
+                f"{frame_name} in {frames_root}"
+            )
+
+        return images
+
+    def __getitem__(self, idx):
+
+        row = self.dataset[idx]
+
+        ep_id = row["episode_index"]
+
+        ep_start, ep_end = (
+            self.episode_ranges[ep_id]
+        )
+
+        actions = []
+        eef_actions = []
+        for k in range(self.action_horizon):
+            target_idx = min(
+                idx + k,
+                ep_end,
+            )
+            target_row = self.dataset[target_idx]
+            actions.append(target_row["action"])
+            eef_actions.append(target_row["eef_sim_pose_action"])
+
+        return {
+
+            "images": self._load_images(row),
+
+            "instruction":
+                build_instruction(
+                    row["subtask_annotation"]
+                ),
+
+            "observation_state":
+                torch.tensor(
+                    row["observation.state"],
+                    dtype=torch.float32,
+                ),
+
+            "eef_state":
+                torch.tensor(
+                    row["eef_sim_pose_state"],
+                    dtype=torch.float32,
+                ),
+
+            "action":
+                torch.tensor(
+                    actions,
+                    dtype=torch.float32,
+                ),
+
+            "eef_action":
+                torch.tensor(
+                    eef_actions,
+                    dtype=torch.float32,
+                ),
+
+            "dataset_name":
+                row["dataset_name"],
+
+            "episode_id":
+                ep_id,
+
+            "frame_index":
+                row["frame_index"],
+        }
+        """
+
 class VideoDataset(Dataset):
     def __init__(self, dataset, video_root, action_horizon):
-        """
+        ""
         Store configuration and dataset metadata.
-        """
+        ""
         self.dataset = dataset
         self.video_root = video_root
         #self.norm_stats = norm_stats
@@ -170,4 +348,4 @@ class EpisodeIterableDataset(VideoDataset, IterableDataset):
 
                     "episode_id": ep_id,
                     "frame_index": row["frame_index"],
-                }
+                }"""

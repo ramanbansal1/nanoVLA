@@ -82,6 +82,7 @@ class VLM:
             images=images_list if is_batch else images_list[0],
             return_tensors="pt",
             padding=True,
+            do_rescale=False,
         ).to(self.device)
 
         with torch.no_grad():
