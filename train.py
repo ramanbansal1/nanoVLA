@@ -106,7 +106,7 @@ def main():
     sample_item = train_dataset.dataset[0]
     obs_dim = len(sample_item["observation.state"]) + len(sample_item["eef_sim_pose_state"])
     rngs = nnx.Rngs(42)
-    vla = VLA(hidden_size=192, obs_dim=obs_dim, rngs=rngs, dummy=True)
+    vla = VLA(hidden_size=192, obs_dim=obs_dim, rngs=rngs, dummy=False)
 
     import optax
     
