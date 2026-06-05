@@ -165,11 +165,25 @@ def main():
     import orbax.checkpoint as ocp
     
     options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+    checkpointers = {
+        "model_state": ocp.PyTreeCheckpointer(),
+        "optimizer_state": ocp.PyTreeCheckpointer()
+    }
     checkpoint_manager = ocp.CheckpointManager(
         os.path.abspath(config.checkpoint_dir),
-        item_names=("model_state", "optimizer_state"),
+        checkpointers=checkpointers,
         options=options
     )
+
+    from jax.sharding import Mesh, PartitionSpec, NamedSharding
+    import numpy as np
+
+    # 1. Define a device mesh across all GPUs
+    devices = np.array(jax.devices())
+    mesh = Mesh(devices, axis_names=("data",))
+
+    # 2. Shard the batch dimension across GPUs
+    batch_sharding = NamedSharding(mesh, PartitionSpec("data"))
 
     from tqdm.auto import tqdm
 
@@ -212,8 +226,16 @@ def main():
             action_np = np.array(action_jnp)
             token_ids, clean_mask = vla.action_tokenizer.tokenize(action_np)
             
-            # Compute loss and gradients using JIT-compiled train_step
-            loss_val, aux, grads = train_step(vla, optimizer, vlm_out, observation_jnp, token_ids, clean_mask, t, noise_key)
+            # 3. In your train loop, shard each batch before the step
+            with mesh:
+                vlm_out = jax.device_put(vlm_out, batch_sharding)
+                observation_jnp = jax.device_put(observation_jnp, batch_sharding)
+                token_ids = jax.device_put(token_ids, batch_sharding)
+                clean_mask = jax.device_put(clean_mask, batch_sharding)
+                t = jax.device_put(t, batch_sharding)
+                
+                # Compute loss and gradients using JIT-compiled train_step
+                loss_val, aux, grads = train_step(vla, optimizer, vlm_out, observation_jnp, token_ids, clean_mask, t, noise_key)
             latent, noisy_emb, pred_decoded, clean_emb, clean_mask = aux
             
             # Wait for async dispatch to finish before logging
@@ -262,8 +284,8 @@ def main():
                 checkpoint_manager.save(
                     global_step, 
                     args=ocp.args.Composite(
-                        model_state=ocp.args.StandardSave(model_state),
-                        optimizer_state=ocp.args.StandardSave(opt_state)
+                        model_state=ocp.args.PyTreeSave(model_state),
+                        optimizer_state=ocp.args.PyTreeSave(opt_state)
                     )
                 )
                 checkpoint_manager.wait_until_finished()
