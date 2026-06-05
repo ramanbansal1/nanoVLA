@@ -138,7 +138,7 @@ class VLA(nnx.Module):
         )
         self.dit = DiT(config=dit_config, rngs=rngs)
 
-    def __call__(self, images, instruction, observation, action, t=None):
+    def __call__(self, images, instruction, observation, action=None, action_emb=None, action_mask=None, t=None, decode_action=False, vlm_out=None):
         """
         Returns:
             vlm_modulated: shape [B, S, hidden_size]
@@ -150,14 +150,18 @@ class VLA(nnx.Module):
             decoded_actions: list of decoded action sequences
         """
         # 1. Process images and instructions via VLM
-        vlm_out = self.vlm(images, instruction)
+        if vlm_out is None:
+            vlm_out = self.vlm(images, instruction)
         
         # 2. Project and Modulate VLM features
         vlm_proj_out = self.vlm_proj(vlm_out)
         vlm_modulated = self.modulator(vlm_proj_out)
         
         # 3. Action Tokenizer (using whatever is passed as action, e.g., x_t)
-        action_emb, action_mask = self.action_tokenizer(action)
+        if action is not None:
+            action_emb, action_mask = self.action_tokenizer(action)
+        elif action_emb is None or action_mask is None:
+            raise ValueError("Either action or (action_emb, action_mask) must be provided")
         
         # 4. Observation Projector
         obs_emb = self.obs_projector(observation)
@@ -208,6 +212,9 @@ class VLA(nnx.Module):
             latent = latent + (dit_action_emb / K)
             
         # 6. Final Decode (Only once at the end)
-        decoded_actions = self.action_tokenizer.decode(latent, mask=action_mask)
+        if decode_action:
+            decoded_actions = self.action_tokenizer.decode(latent, mask=action_mask)
+        else:
+            decoded_actions = None
             
         return vlm_modulated, action_emb, action_mask, obs_emb, dit_out, latent, decoded_actions

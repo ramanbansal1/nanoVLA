@@ -9,8 +9,13 @@ from torch.utils.data import DataLoader
 from data.advanced_dataset import VideoDataset
 
 def main():
+    from config import parse_args, asdict
+    config = parse_args()
+    
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = config.jax_mem_fraction
+    
     import wandb
-    wandb.init(project="nanoVLA")
+    wandb.init(project=config.wandb_project, config=asdict(config))
     # 1. Load the underlying huggingface dataset
     
     
@@ -42,16 +47,11 @@ def main():
         all_datasets
     )
 
-    # 2. Setup paths and parameters
-    datasets_root = "data/datasets"
-    action_horizon = 8
-
     # 3. Instantiate the VideoDataset
-    
     train_dataset = VideoDataset(
         dataset=combined_dataset,
-        datasets_root=datasets_root,
-        action_horizon=action_horizon,
+        datasets_root=config.datasets_root,
+        action_horizon=config.action_horizon,
     )
 
     print(f"Loaded VideoDataset with {len(train_dataset)} items.")
@@ -95,10 +95,10 @@ def main():
     # 4. Create a DataLoader (example)
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=1, 
+        batch_size=config.batch_size, 
         shuffle=True, 
         pin_memory=True,
-        num_workers=4,
+        num_workers=config.num_workers,
         collate_fn=custom_collate_fn
     )
 
@@ -111,49 +111,49 @@ def main():
     sample_item = train_dataset.dataset[0]
     obs_dim = len(sample_item["observation.state"]) + len(sample_item["eef_sim_pose_state"])
     rngs = nnx.Rngs(42)
-    vla = VLA(hidden_size=192, obs_dim=obs_dim, rngs=rngs, dummy=False)
+    vla = VLA(hidden_size=config.hidden_size, obs_dim=obs_dim, rngs=rngs, dummy=config.dummy_vlm)
 
     import optax
     
     # Initialize Optimizer
-    optimizer = nnx.Optimizer(vla, optax.nadam(learning_rate=1e-4), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(vla, optax.nadam(learning_rate=config.learning_rate), wrt=nnx.Param)
     
     # Define the loss function for a single batch
-    def loss_fn(model, images, instruction, observation, action, t, clean_action):
+    def loss_fn(model, vlm_out, observation, token_ids, clean_mask, t, noise_key):
+        clean_emb = model.action_tokenizer.action_emb(token_ids)
+        
+        noise = jax.random.normal(noise_key, clean_emb.shape)
+        t_exp = t.reshape(-1, 1, 1) if clean_emb.ndim == 3 else t.reshape(-1, 1)
+        x_t = (1 - t_exp) * noise + t_exp * clean_emb
+        
         vlm_modulated, action_emb, action_mask, obs_emb, dit_out, latent, decoded_actions = model(
-            images=images, 
-            instruction=instruction, 
+            images=None, 
+            instruction=None, 
             observation=observation, 
-            action=action,
-            t=t
+            action=None,
+            action_emb=x_t,
+            action_mask=clean_mask,
+            t=t,
+            vlm_out=vlm_out
         )
         
-        clean_emb, clean_mask = model.action_tokenizer(clean_action)
-        noisy_emb = action_emb
-        
-        target_len = noisy_emb.shape[1]
-        current_len = clean_emb.shape[1]
-        
-        if current_len > target_len:
-            clean_emb = clean_emb[:, :target_len, :]
-            clean_mask = clean_mask[:, :target_len]
-        elif current_len < target_len:
-            pad_width = ((0, 0), (0, target_len - current_len), (0, 0))
-            clean_emb = jnp.pad(clean_emb, pad_width)
-            
-            mask_pad_width = ((0, 0), (0, target_len - current_len))
-            clean_mask = jnp.pad(clean_mask, mask_pad_width, constant_values=False)
-            
-        velocity_target = clean_emb - noisy_emb
-        predicted_velocity = latent - noisy_emb
+        velocity_target = clean_emb - noise
+        predicted_velocity = latent - x_t
             
         loss = (predicted_velocity - velocity_target) ** 2
         # Mask out padded tokens
-        loss = loss * action_mask[:, :, None]
+        loss = loss * clean_mask[:, :, None]
         
         # Average loss only over valid (unmasked) tokens
-        loss_val = jnp.sum(loss) / (jnp.sum(action_mask) * loss.shape[-1])
-        return loss_val, (latent, noisy_emb, decoded_actions, clean_emb, clean_mask)
+        loss_val = jnp.sum(loss) / (jnp.sum(clean_mask) * loss.shape[-1])
+        return loss_val, (latent, x_t, decoded_actions, clean_emb, clean_mask)
+
+    @nnx.jit
+    def train_step(model, optimizer, vlm_out, observation, token_ids, clean_mask, t, noise_key):
+        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+        (loss_val, aux), grads = grad_fn(model, vlm_out, observation, token_ids, clean_mask, t, noise_key)
+        optimizer.update(model, grads)
+        return loss_val, aux, grads
 
     from tqdm.auto import tqdm
 
@@ -163,12 +163,11 @@ def main():
         
         # Convert torch inputs to jnp.ndarray safely
         def torch_to_jax(t):
-            # Put on default CUDA device explicitly if possible
-            t_cuda = t.cuda(non_blocking=True).contiguous()
             try:
+                t_cuda = t.cuda(non_blocking=True).contiguous()
                 return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t_cuda))
             except Exception:
-                return jnp.array(t.numpy())
+                return jnp.array(t.contiguous().numpy())
 
         images_jnp = torch_to_jax(batch['image'])
         instruction = batch['instruction'][0]  # Take first instruction since batch_size=1
@@ -181,33 +180,41 @@ def main():
         eef_action_jnp = torch_to_jax(batch['eef_action'])
         action_jnp = jnp.concatenate([action_jnp, eef_action_jnp], axis=-1)
         
-        # Generate noise and timestep for Flow Matching
+        # Generate timestep and noise key for Flow Matching
         key = jax.random.PRNGKey(step)
         key, noise_key, t_key = jax.random.split(key, 3)
         
-        noise = jax.random.normal(noise_key, action_jnp.shape)
         t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
-        t_exp = t.reshape(-1, 1, 1) if action_jnp.ndim == 3 else t.reshape(-1, 1)
-        x_t = (1 - t_exp) * noise + t_exp * action_jnp
         
-        # Compute loss and gradients
-        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-        (loss_val, aux), grads = grad_fn(vla, images_jnp, instruction, observation_jnp, x_t, t, action_jnp)
+        # Precompute VLM output outside JIT
+        vlm_out = vla.vlm(images_jnp, instruction)
+        
+        # Tokenize actions outside JIT to avoid Tracer issues with Scipy
+        import numpy as np
+        action_np = np.array(action_jnp)
+        token_ids, clean_mask = vla.action_tokenizer.tokenize(action_np)
+        
+        # Compute loss and gradients using JIT-compiled train_step
+        loss_val, aux, grads = train_step(vla, optimizer, vlm_out, observation_jnp, token_ids, clean_mask, t, noise_key)
         latent, noisy_emb, pred_decoded, clean_emb, clean_mask = aux
+        
+        # Wait for async dispatch to finish before logging
+        loss_val = jax.block_until_ready(loss_val)
         
         # Calculate aux metrics
         grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads)]))
         latent_drift = jnp.mean(jnp.abs(latent - noisy_emb))
-        actual_decoded = vla.action_tokenizer.decode(clean_emb, mask=clean_mask)
-        
-        # Update model weights
-        optimizer.update(vla, grads)
+        if pred_decoded is not None:
+            actual_decoded = vla.action_tokenizer.decode(clean_emb, mask=clean_mask)
+        else:
+            actual_decoded = None
         
         import numpy as np
         mses = []
-        for p, a in zip(pred_decoded, actual_decoded):
-            if p.shape == a.shape and p.size > 0:
-                mses.append(np.mean((p - a)**2))
+        if pred_decoded is not None:
+            for p, a in zip(pred_decoded, actual_decoded):
+                if p.shape == a.shape and p.size > 0:
+                    mses.append(np.mean((p - a)**2))
         
         if len(mses) > 0:
             decoded_mse = float(np.mean(mses))

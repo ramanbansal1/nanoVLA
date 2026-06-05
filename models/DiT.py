@@ -325,7 +325,7 @@ class DiT(nnx.Module):
         c = self.timestep_embedder(t)
         
         for block in self.blocks:
-            x = block(
+            x = nnx.remat(block)(
                 x=x, 
                 context=context, 
                 c=c, 

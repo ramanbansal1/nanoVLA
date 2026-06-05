@@ -1,0 +1,57 @@
+import argparse
+from dataclasses import dataclass, field, asdict
+
+@dataclass
+class TrainConfig:
+    datasets_root: str = "data/datasets"
+    action_horizon: int = 8
+    batch_size: int = 100
+    num_workers: int = 4
+    hidden_size: int = 192
+    learning_rate: float = 1e-4
+    dummy_vlm: bool = True
+    wandb_project: str = "nanoVLA"
+    jax_mem_fraction: str = ".70"
+
+def parse_args() -> TrainConfig:
+    parser = argparse.ArgumentParser(description="nanoVLA Training Configuration")
+    
+    # We use the defaults from the dataclass
+    default_config = TrainConfig()
+    
+    parser.add_argument("--datasets_root", type=str, default=default_config.datasets_root,
+                        help=f"Path to datasets root directory (default: {default_config.datasets_root})")
+    parser.add_argument("--action_horizon", type=int, default=default_config.action_horizon,
+                        help=f"Action horizon (default: {default_config.action_horizon})")
+    parser.add_argument("--batch_size", type=int, default=default_config.batch_size,
+                        help=f"Batch size (default: {default_config.batch_size})")
+    parser.add_argument("--num_workers", type=int, default=default_config.num_workers,
+                        help=f"Number of dataloader workers (default: {default_config.num_workers})")
+    parser.add_argument("--hidden_size", type=int, default=default_config.hidden_size,
+                        help=f"Hidden size for models (default: {default_config.hidden_size})")
+    parser.add_argument("--learning_rate", type=float, default=default_config.learning_rate,
+                        help=f"Learning rate (default: {default_config.learning_rate})")
+    
+    # Booleans are slightly tricky with argparse, but we can use simple string matching or store_true/store_false
+    parser.add_argument("--dummy_vlm", type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=default_config.dummy_vlm,
+                        help=f"Use dummy VLM for fast testing (default: {default_config.dummy_vlm})")
+    
+    parser.add_argument("--wandb_project", type=str, default=default_config.wandb_project,
+                        help=f"W&B project name (default: {default_config.wandb_project})")
+    
+    parser.add_argument("--jax_mem_fraction", type=str, default=default_config.jax_mem_fraction,
+                        help=f"XLA_PYTHON_CLIENT_MEM_FRACTION (default: {default_config.jax_mem_fraction})")
+    
+    args = parser.parse_args()
+    
+    return TrainConfig(
+        datasets_root=args.datasets_root,
+        action_horizon=args.action_horizon,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        hidden_size=args.hidden_size,
+        learning_rate=args.learning_rate,
+        dummy_vlm=args.dummy_vlm,
+        wandb_project=args.wandb_project,
+        jax_mem_fraction=args.jax_mem_fraction
+    )

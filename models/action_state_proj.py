@@ -11,18 +11,24 @@ class ActionTokenizer(nnx.Module):
             "physical-intelligence/fast", trust_remote_code=True
         )
 
-        self.action_emb = nnx.Embed(self.tokenizer.vocab_size, hidden_size, rngs=rngs)
+        self.action_emb = nnx.Embed(self.tokenizer.vocab_size + 1, hidden_size, rngs=rngs)
 
-    def __call__(self, action):
-        token_ids = self.tokenizer(action)
+    def tokenize(self, action):
+        # Convert to numpy to avoid tracer issues in scipy
+        action_np = np.array(action)
+        token_ids = self.tokenizer(action_np)
         
         # Pad sequences to max length in the batch
         max_len = max(len(seq) for seq in token_ids)
-        padded_token_ids = [seq + [0] * (max_len - len(seq)) for seq in token_ids]
+        pad_token = self.tokenizer.vocab_size
+        padded_token_ids = [seq + [pad_token] * (max_len - len(seq)) for seq in token_ids]
 
         token_ids = jnp.asarray(padded_token_ids)
-        mask = (token_ids != 0)
-        
+        mask = (token_ids != pad_token)
+        return token_ids, mask
+
+    def __call__(self, action):
+        token_ids, mask = self.tokenize(action)
         action_embed = self.action_emb(token_ids)
         return action_embed, mask
 
@@ -34,8 +40,14 @@ class ActionTokenizer(nnx.Module):
             mask = np.array(mask)
             
         decoded_batch = []
+        pad_token = self.tokenizer.vocab_size
         for i in range(tokens.shape[0]):
             valid_tokens = tokens[i][mask[i]] if mask is not None else tokens[i]
+            
+            # During inference (mask=None), the model might predict pad_tokens at the end
+            # We must filter them out so the HF tokenizer doesn't crash/return zeros.
+            valid_tokens = valid_tokens[valid_tokens != pad_token]
+            
             # Wrap the 1D list in another list to indicate a batch of size 1
             decoded = self.tokenizer.decode([valid_tokens.tolist()])
             decoded_batch.append(decoded[0])
