@@ -9,9 +9,14 @@ class TrainConfig:
     num_workers: int = 4
     hidden_size: int = 192
     learning_rate: float = 1e-4
-    dummy_vlm: bool = True
+    dummy_vlm: bool = False
     wandb_project: str = "nanoVLA"
     jax_mem_fraction: str = ".70"
+    num_epochs: int = 30
+    save_every: int = 100
+    checkpoint_dir: str = "checkpoints/nanoVLA"
+    dit_num_blocks: int = 4
+    vla_k: int = 4
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="nanoVLA Training Configuration")
@@ -42,6 +47,17 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--jax_mem_fraction", type=str, default=default_config.jax_mem_fraction,
                         help=f"XLA_PYTHON_CLIENT_MEM_FRACTION (default: {default_config.jax_mem_fraction})")
     
+    parser.add_argument("--num_epochs", type=int, default=default_config.num_epochs,
+                        help=f"Number of training epochs (default: {default_config.num_epochs})")
+    parser.add_argument("--save_every", type=int, default=default_config.save_every,
+                        help=f"Save checkpoint every N steps (default: {default_config.save_every})")
+    parser.add_argument("--checkpoint_dir", type=str, default=default_config.checkpoint_dir,
+                        help=f"Directory to save checkpoints (default: {default_config.checkpoint_dir})")
+    parser.add_argument("--dit_num_blocks", type=int, default=default_config.dit_num_blocks,
+                        help=f"Number of DiT blocks (default: {default_config.dit_num_blocks})")
+    parser.add_argument("--vla_k", type=int, default=default_config.vla_k,
+                        help=f"Number of flow matching iterations K (default: {default_config.vla_k})")
+    
     args = parser.parse_args()
     
     return TrainConfig(
@@ -53,5 +69,10 @@ def parse_args() -> TrainConfig:
         learning_rate=args.learning_rate,
         dummy_vlm=args.dummy_vlm,
         wandb_project=args.wandb_project,
-        jax_mem_fraction=args.jax_mem_fraction
+        jax_mem_fraction=args.jax_mem_fraction,
+        num_epochs=args.num_epochs,
+        save_every=args.save_every,
+        checkpoint_dir=args.checkpoint_dir,
+        dit_num_blocks=args.dit_num_blocks,
+        vla_k=args.vla_k
     )

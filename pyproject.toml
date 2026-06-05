@@ -19,4 +19,5 @@ dependencies = [
     "genesis-world>=1.1.0",
     "wandb>=0.27.1",
     "weave>=0.52.42",
+    "orbax-checkpoint>=0.11.40",
 ]

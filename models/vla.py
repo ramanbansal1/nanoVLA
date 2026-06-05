@@ -118,8 +118,9 @@ from models.modulator import Modulator
 from models.DiT import DiT, DiTConfig
 
 class VLA(nnx.Module):
-    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, vlm_dim: int = 576, dummy: bool = False):
+    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, vlm_dim: int = 576, dummy: bool = False, dit_num_blocks: int = 4, vla_k: int = 4):
         self.hidden_size = hidden_size
+        self.vla_k = vla_k
         self.vlm = VLM(dummy=dummy)
         
         # Project VLM output to 3 * hidden_size for the Modulator
@@ -134,7 +135,7 @@ class VLA(nnx.Module):
             context_dim=hidden_size,
             num_heads=6,
             mlp_hidden_dim=hidden_size * 4,
-            num_blocks=4
+            num_blocks=dit_num_blocks
         )
         self.dit = DiT(config=dit_config, rngs=rngs)
 
@@ -195,7 +196,7 @@ class VLA(nnx.Module):
             current_t = t
             
         latent = action_emb
-        K = 4
+        K = self.vla_k
         
         for k_iter in range(K):
             x = jnp.concatenate([obs_emb_seq, latent], axis=1) # [B, 1 + horizon, hidden_size]

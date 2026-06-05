@@ -111,7 +111,14 @@ def main():
     sample_item = train_dataset.dataset[0]
     obs_dim = len(sample_item["observation.state"]) + len(sample_item["eef_sim_pose_state"])
     rngs = nnx.Rngs(42)
-    vla = VLA(hidden_size=config.hidden_size, obs_dim=obs_dim, rngs=rngs, dummy=config.dummy_vlm)
+    vla = VLA(
+        hidden_size=config.hidden_size, 
+        obs_dim=obs_dim, 
+        rngs=rngs, 
+        dummy=config.dummy_vlm,
+        dit_num_blocks=config.dit_num_blocks,
+        vla_k=config.vla_k
+    )
 
     import optax
     
@@ -155,86 +162,113 @@ def main():
         optimizer.update(model, grads)
         return loss_val, aux, grads
 
+    import orbax.checkpoint as ocp
+    
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+    checkpoint_manager = ocp.CheckpointManager(
+        os.path.abspath(config.checkpoint_dir),
+        item_names=("model_state", "optimizer_state"),
+        options=options
+    )
+
     from tqdm.auto import tqdm
 
-    # Example iterating through batches
-    train_pbar = tqdm(train_loader, desc="Training")
-    for step, batch in enumerate(train_pbar):
+    global_step = 0
+    for epoch in range(config.num_epochs):
+        # Example iterating through batches
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
+        for step, batch in enumerate(train_pbar):
         
-        # Convert torch inputs to jnp.ndarray safely
-        def torch_to_jax(t):
-            try:
-                t_cuda = t.cuda(non_blocking=True).contiguous()
-                return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t_cuda))
-            except Exception:
-                return jnp.array(t.contiguous().numpy())
+            # Convert torch inputs to jnp.ndarray safely
+            def torch_to_jax(t):
+                try:
+                    t_cuda = t.cuda(non_blocking=True).contiguous()
+                    return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t_cuda))
+                except Exception:
+                    return jnp.array(t.contiguous().numpy())
 
-        images_jnp = torch_to_jax(batch['image'])
-        instruction = batch['instruction'][0]  # Take first instruction since batch_size=1
-        
-        observation_jnp = torch_to_jax(batch['observation_state'])
-        eef_state_jnp = torch_to_jax(batch['eef_state'])
-        observation_jnp = jnp.concatenate([observation_jnp, eef_state_jnp], axis=-1)
-        
-        action_jnp = torch_to_jax(batch['action'])
-        eef_action_jnp = torch_to_jax(batch['eef_action'])
-        action_jnp = jnp.concatenate([action_jnp, eef_action_jnp], axis=-1)
-        
-        # Generate timestep and noise key for Flow Matching
-        key = jax.random.PRNGKey(step)
-        key, noise_key, t_key = jax.random.split(key, 3)
-        
-        t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
-        
-        # Precompute VLM output outside JIT
-        vlm_out = vla.vlm(images_jnp, instruction)
-        
-        # Tokenize actions outside JIT to avoid Tracer issues with Scipy
-        import numpy as np
-        action_np = np.array(action_jnp)
-        token_ids, clean_mask = vla.action_tokenizer.tokenize(action_np)
-        
-        # Compute loss and gradients using JIT-compiled train_step
-        loss_val, aux, grads = train_step(vla, optimizer, vlm_out, observation_jnp, token_ids, clean_mask, t, noise_key)
-        latent, noisy_emb, pred_decoded, clean_emb, clean_mask = aux
-        
-        # Wait for async dispatch to finish before logging
-        loss_val = jax.block_until_ready(loss_val)
-        
-        # Calculate aux metrics
-        grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads)]))
-        latent_drift = jnp.mean(jnp.abs(latent - noisy_emb))
-        if pred_decoded is not None:
-            actual_decoded = vla.action_tokenizer.decode(clean_emb, mask=clean_mask)
-        else:
-            actual_decoded = None
-        
-        import numpy as np
-        mses = []
-        if pred_decoded is not None:
-            for p, a in zip(pred_decoded, actual_decoded):
-                if p.shape == a.shape and p.size > 0:
-                    mses.append(np.mean((p - a)**2))
-        
-        if len(mses) > 0:
-            decoded_mse = float(np.mean(mses))
-        else:
-            decoded_mse = 0.0
+            images_jnp = torch_to_jax(batch['image'])
+            instruction = batch['instruction'][0]  # Take first instruction since batch_size=1
+            
+            observation_jnp = torch_to_jax(batch['observation_state'])
+            eef_state_jnp = torch_to_jax(batch['eef_state'])
+            observation_jnp = jnp.concatenate([observation_jnp, eef_state_jnp], axis=-1)
+            
+            action_jnp = torch_to_jax(batch['action'])
+            eef_action_jnp = torch_to_jax(batch['eef_action'])
+            action_jnp = jnp.concatenate([action_jnp, eef_action_jnp], axis=-1)
+            
+            # Generate timestep and noise key for Flow Matching
+            key = jax.random.PRNGKey(global_step)
+            key, noise_key, t_key = jax.random.split(key, 3)
+            
+            t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
+            
+            # Precompute VLM output outside JIT
+            vlm_out = vla.vlm(images_jnp, instruction)
+            
+            # Tokenize actions outside JIT to avoid Tracer issues with Scipy
+            import numpy as np
+            action_np = np.array(action_jnp)
+            token_ids, clean_mask = vla.action_tokenizer.tokenize(action_np)
+            
+            # Compute loss and gradients using JIT-compiled train_step
+            loss_val, aux, grads = train_step(vla, optimizer, vlm_out, observation_jnp, token_ids, clean_mask, t, noise_key)
+            latent, noisy_emb, pred_decoded, clean_emb, clean_mask = aux
+            
+            # Wait for async dispatch to finish before logging
+            loss_val = jax.block_until_ready(loss_val)
+            
+            # Calculate aux metrics
+            grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads)]))
+            latent_drift = jnp.mean(jnp.abs(latent - noisy_emb))
+            if pred_decoded is not None:
+                actual_decoded = vla.action_tokenizer.decode(clean_emb, mask=clean_mask)
+            else:
+                actual_decoded = None
+            
+            import numpy as np
+            mses = []
+            if pred_decoded is not None:
+                for p, a in zip(pred_decoded, actual_decoded):
+                    if p.shape == a.shape and p.size > 0:
+                        mses.append(np.mean((p - a)**2))
+            
+            if len(mses) > 0:
+                decoded_mse = float(np.mean(mses))
+            else:
+                decoded_mse = 0.0
 
-        log_dict = {
-            "train/loss": float(loss_val),
-            "train/grad_norm": float(grad_norm),
-            "train/latent_drift": float(latent_drift),
-            "eval/decoded_mse": decoded_mse
-        }
-        
-        wandb.log(log_dict, step=step)
-        train_pbar.set_postfix({
-            "loss": f"{float(loss_val):.4f}",
-            "grad": f"{float(grad_norm):.3f}",
-            "drift": f"{float(latent_drift):.3f}",
-            "mse": f"{decoded_mse:.4f}"
-        })
+            log_dict = {
+                "train/loss": float(loss_val),
+                "train/grad_norm": float(grad_norm),
+                "train/latent_drift": float(latent_drift),
+                "eval/decoded_mse": decoded_mse
+            }
+            
+            log_dict["epoch"] = epoch + 1
+            wandb.log(log_dict, step=global_step)
+            train_pbar.set_postfix({
+                "loss": f"{float(loss_val):.4f}",
+                "grad": f"{float(grad_norm):.3f}",
+                "drift": f"{float(latent_drift):.3f}",
+                "mse": f"{decoded_mse:.4f}"
+            })
+            
+            # Save checkpoint periodically
+            if global_step % config.save_every == 0 and global_step > 0:
+                _, model_state = nnx.split(vla)
+                _, opt_state = nnx.split(optimizer)
+                checkpoint_manager.save(
+                    global_step, 
+                    args=ocp.args.Composite(
+                        model_state=ocp.args.StandardSave(model_state),
+                        optimizer_state=ocp.args.StandardSave(opt_state)
+                    )
+                )
+                checkpoint_manager.wait_until_finished()
+                
+            global_step += 1
 
 if __name__ == "__main__":
     main()
