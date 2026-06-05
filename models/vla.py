@@ -101,8 +101,9 @@ class VLM:
         
         try:
             # PyTorch tensors natively support the DLPack protocol in recent versions
-            last_hidden_jnp = jax.dlpack.from_dlpack(last_hidden)
-        except (TypeError, ValueError):
+            import torch.utils.dlpack
+            last_hidden_jnp = jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(last_hidden))
+        except Exception:
             # Fallback to NumPy conversion if DLPack fails or device mismatch
             last_hidden_jnp = jnp.array(last_hidden.cpu().to(torch.float32).numpy())
             

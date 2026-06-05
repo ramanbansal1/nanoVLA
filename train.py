@@ -1,3 +1,6 @@
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
@@ -94,6 +97,7 @@ def main():
         batch_size=1, 
         shuffle=True, 
         pin_memory=True,
+        num_workers=4,
         collate_fn=custom_collate_fn
     )
 
@@ -156,16 +160,25 @@ def main():
     train_pbar = tqdm(train_loader, desc="Training")
     for step, batch in enumerate(train_pbar):
         
-        # Convert torch inputs to jnp.ndarray
-        images_jnp = jnp.array(batch['image'].numpy())
+        # Convert torch inputs to jnp.ndarray safely
+        def torch_to_jax(t):
+            # Put on default CUDA device explicitly if possible
+            t_cuda = t.cuda(non_blocking=True).contiguous()
+            try:
+                import torch.utils.dlpack
+                return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t_cuda))
+            except Exception:
+                return jnp.array(t.numpy())
+
+        images_jnp = torch_to_jax(batch['image'])
         instruction = batch['instruction'][0]  # Take first instruction since batch_size=1
         
-        observation_jnp = jnp.array(batch['observation_state'].numpy())
-        eef_state_jnp = jnp.array(batch['eef_state'].numpy())
+        observation_jnp = torch_to_jax(batch['observation_state'])
+        eef_state_jnp = torch_to_jax(batch['eef_state'])
         observation_jnp = jnp.concatenate([observation_jnp, eef_state_jnp], axis=-1)
         
-        action_jnp = jnp.array(batch['action'].numpy())
-        eef_action_jnp = jnp.array(batch['eef_action'].numpy())
+        action_jnp = torch_to_jax(batch['action'])
+        eef_action_jnp = torch_to_jax(batch['eef_action'])
         action_jnp = jnp.concatenate([action_jnp, eef_action_jnp], axis=-1)
         
         # Generate noise and timestep for Flow Matching
