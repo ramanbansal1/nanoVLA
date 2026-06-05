@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "datasets",
     "flax>=0.12.7",
-    "jax>=0.10.1",
+    "jax[cuda12]>=0.10.1",
     "opencv-python>=4.13.0.92",
     "optax>=0.2.8",
     "scipy",

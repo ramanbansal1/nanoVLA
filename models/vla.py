@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import torch
+import torch.utils.dlpack
 import numpy as np
 from transformers import AutoProcessor, AutoModelForVision2Seq
 
@@ -101,7 +102,6 @@ class VLM:
         
         try:
             # PyTorch tensors natively support the DLPack protocol in recent versions
-            import torch.utils.dlpack
             last_hidden_jnp = jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(last_hidden))
         except Exception:
             # Fallback to NumPy conversion if DLPack fails or device mismatch

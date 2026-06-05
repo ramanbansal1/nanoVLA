@@ -2,6 +2,7 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import torch
+import torch.utils.dlpack
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
@@ -165,7 +166,6 @@ def main():
             # Put on default CUDA device explicitly if possible
             t_cuda = t.cuda(non_blocking=True).contiguous()
             try:
-                import torch.utils.dlpack
                 return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t_cuda))
             except Exception:
                 return jnp.array(t.numpy())
