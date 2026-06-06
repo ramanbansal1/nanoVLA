@@ -52,6 +52,7 @@ def main():
         dataset=combined_dataset,
         datasets_root=config.datasets_root,
         action_horizon=config.action_horizon,
+        vlm_context_root=config.vlm_context_dir,
     )
 
     print(f"Loaded VideoDataset with {len(train_dataset)} items.")
@@ -201,7 +202,11 @@ def main():
                 except Exception:
                     return jnp.array(t.contiguous().numpy())
 
-            images_jnp = torch_to_jax(batch['image'])
+            if 'vlm_context' in batch:
+                vlm_out = torch_to_jax(batch['vlm_context'])
+            else:
+                images_jnp = torch_to_jax(batch['image'])
+                
             instruction = batch['instruction'][0]  # Take first instruction since batch_size=1
             
             observation_jnp = torch_to_jax(batch['observation_state'])
@@ -218,8 +223,9 @@ def main():
             
             t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
             
-            # Precompute VLM output outside JIT
-            vlm_out = vla.vlm(images_jnp, instruction)
+            # Precompute VLM output outside JIT if not already precomputed
+            if 'vlm_context' not in batch:
+                vlm_out = vla.vlm(images_jnp, instruction)
             
             # Tokenize actions outside JIT to avoid Tracer issues with Scipy
             import numpy as np

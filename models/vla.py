@@ -58,15 +58,15 @@ class VLM:
             raise ValueError(f"Expected images to be 3D or 4D, got {images_np.ndim}D")
 
         # Build messages format for the processor
-        # If batch, we duplicate the instruction for each image in the batch
         messages = []
-        for _ in range(len(images_list)):
+        for i in range(len(images_list)):
+            inst = instruction[i] if isinstance(instruction, list) else instruction
             messages.append([
                 {
                     "role": "user",
                     "content": [
                         {"type": "image"},
-                        {"type": "text", "text": instruction},
+                        {"type": "text", "text": inst},
                     ],
                 }
             ])

@@ -17,6 +17,7 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints/nanoVLA"
     dit_num_blocks: int = 4
     vla_k: int = 4
+    vlm_context_dir: str = "data/vlm_context"
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="nanoVLA Training Configuration")
@@ -57,6 +58,8 @@ def parse_args() -> TrainConfig:
                         help=f"Number of DiT blocks (default: {default_config.dit_num_blocks})")
     parser.add_argument("--vla_k", type=int, default=default_config.vla_k,
                         help=f"Number of flow matching iterations K (default: {default_config.vla_k})")
+    parser.add_argument("--vlm_context_dir", type=str, default=default_config.vlm_context_dir,
+                        help=f"Directory containing precomputed VLM embeddings (default: {default_config.vlm_context_dir})")
     
     args = parser.parse_args()
     

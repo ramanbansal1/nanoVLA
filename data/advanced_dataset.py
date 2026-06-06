@@ -44,9 +44,11 @@ class VideoDataset(Dataset):
         dataset,
         datasets_root,
         action_horizon,
+        vlm_context_root=None,
     ):
         self.dataset = dataset
         self.datasets_root = Path(datasets_root)
+        self.vlm_context_root = Path(vlm_context_root) if vlm_context_root else None
         self.action_horizon = action_horizon
 
         self.state_dim = len(
@@ -123,6 +125,18 @@ class VideoDataset(Dataset):
 
         return images
 
+    def _load_vlm_context(self, row):
+        dataset_name = row["dataset_name"]
+        ep_id = row["episode_index"]
+        frame_idx = row["frame_index"]
+        
+        npy_path = self.vlm_context_root / dataset_name / f"{ep_id:06d}_{frame_idx:06d}.npy"
+        
+        if not npy_path.exists():
+            raise FileNotFoundError(f"Precomputed VLM context missing: {npy_path}")
+            
+        return torch.tensor(np.load(npy_path), dtype=torch.float32)
+
     def __getitem__(self, idx):
 
         row = self.dataset[idx]
@@ -144,10 +158,7 @@ class VideoDataset(Dataset):
             actions.append(target_row["action"])
             eef_actions.append(target_row["eef_sim_pose_action"])
 
-        return {
-
-            "images": self._load_images(row),
-
+        data = {
             "instruction":
                 build_instruction(
                     row["subtask_annotation"]
@@ -186,6 +197,13 @@ class VideoDataset(Dataset):
             "frame_index":
                 row["frame_index"],
         }
+        
+        if self.vlm_context_root is not None:
+            data["vlm_context"] = self._load_vlm_context(row)
+        else:
+            data["images"] = self._load_images(row)
+            
+        return data
         """
 
 class VideoDataset(Dataset):
