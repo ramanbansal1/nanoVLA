@@ -77,5 +77,6 @@ def parse_args() -> TrainConfig:
         save_every=args.save_every,
         checkpoint_dir=args.checkpoint_dir,
         dit_num_blocks=args.dit_num_blocks,
-        vla_k=args.vla_k
+        vla_k=args.vla_k,
+        vlm_context_dir=args.vlm_context_dir
     )
