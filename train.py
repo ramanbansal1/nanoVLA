@@ -100,7 +100,8 @@ def main():
         shuffle=True, 
         pin_memory=True,
         num_workers=config.num_workers,
-        collate_fn=custom_collate_fn
+        collate_fn=custom_collate_fn,
+        drop_last=True
     )
 
     # 5. Instantiate VLA
@@ -250,17 +251,17 @@ def main():
             # Calculate aux metrics
             grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads)]))
             latent_drift = jnp.mean(jnp.abs(latent - noisy_emb))
-            if pred_decoded is not None:
-                actual_decoded = vla.action_tokenizer.decode(clean_emb, mask=clean_mask)
-            else:
-                actual_decoded = None
             
             import numpy as np
+            
+            # Decode actions OUTSIDE of JIT to avoid Tracer errors with scipy
+            pred_decoded = vla.action_tokenizer.decode(np.array(latent), mask=np.array(clean_mask))
+            actual_decoded = vla.action_tokenizer.decode(np.array(clean_emb), mask=np.array(clean_mask))
+            
             mses = []
-            if pred_decoded is not None:
-                for p, a in zip(pred_decoded, actual_decoded):
-                    if p.shape == a.shape and p.size > 0:
-                        mses.append(np.mean((p - a)**2))
+            for p, a in zip(pred_decoded, actual_decoded):
+                if p.shape == a.shape and p.size > 0:
+                    mses.append(np.mean((p - a)**2))
             
             if len(mses) > 0:
                 decoded_mse = float(np.mean(mses))
