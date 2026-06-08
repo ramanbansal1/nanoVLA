@@ -1,14 +1,74 @@
-from flax import nnx
+import dataclasses
+import math
+
 import jax
 import jax.numpy as jnp
-import math
-import dataclasses
+from flax import nnx
+
+
+# ==========================================
+# Helper Functions
+# ==========================================
+
+def flatten_action_patches(x):
+    """
+    (B, A, N, D) -> (B, N, A, D) -> (B, N*A, D)
+    """
+    B, A, N, D = x.shape
+    x = jnp.transpose(x, (0, 2, 1, 3))
+    x = jnp.reshape(x, (B, N * A, D))
+    return x
+
+
+def unflatten_action_patches(x, A, N):
+    """
+    (B, N*A, D) -> (B, N, A, D) -> (B, A, N, D)
+    """
+    B, L, D = x.shape
+    assert L == N * A, f"Sequence length {L} does not match N*A ({N}*{A})"
+    x = jnp.reshape(x, (B, N, A, D))
+    x = jnp.transpose(x, (0, 2, 1, 3))
+    return x
+
+
+def apply_rope(x, cos, sin):
+    """
+    Applies Rotary Position Embedding to the input tensor.
+    x: [B, L, H, D]
+    cos, sin: [1, L, 1, D] or broadcastable
+    """
+    x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+    rotated_x = jnp.stack([-x_reshaped[..., 1], x_reshaped[..., 0]], axis=-1)
+    rotated_x = rotated_x.reshape(x.shape)
+    return (x * cos) + (rotated_x * sin)
+
+
+def modulate(x, shift, scale):
+    return x * (1 + scale[:, None, :]) + shift[:, None, :]
+
+
+# ==========================================
+# Configuration
+# ==========================================
+
+@dataclasses.dataclass
+class DiTConfig:
+    dim: int
+    context_dim: int
+    num_heads: int
+    mlp_hidden_dim: int
+    num_blocks: int
+    frequency_embedding_size: int = 256
+
+
+# ==========================================
+# Core Modules
+# ==========================================
 
 class TimestepEmbedder(nnx.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
-
     def __init__(
         self,
         hidden_size: int,
@@ -64,64 +124,29 @@ class TimestepEmbedder(nnx.Module):
 
     def __call__(self, t):
         x = self.timestep_embedding(t)
-
         x = self.fc1(x)
         x = nnx.silu(x)
-
         x = self.fc2(x)
-
         return x
 
 
 class SwiGLUMLP(nnx.Module):
-
     def __init__(
         self,
         dim: int,
         hidden_dim: int,
         rngs: nnx.Rngs,
     ):
-        self.gate = nnx.Linear(
-            dim,
-            hidden_dim,
-            rngs=rngs,
-        )
-
-        self.up = nnx.Linear(
-            dim,
-            hidden_dim,
-            rngs=rngs,
-        )
-
-        self.down = nnx.Linear(
-            hidden_dim,
-            dim,
-            rngs=rngs,
-        )
+        self.gate = nnx.Linear(dim, hidden_dim, rngs=rngs)
+        self.up = nnx.Linear(dim, hidden_dim, rngs=rngs)
+        self.down = nnx.Linear(hidden_dim, dim, rngs=rngs)
 
     def __call__(self, x):
-
         gate = nnx.silu(self.gate(x))
-
         up = self.up(x)
-
         x = gate * up
-
         x = self.down(x)
-
         return x
-
-
-def apply_rope(x, cos, sin):
-    """
-    Applies Rotary Position Embedding to the input tensor.
-    x: [B, L, H, D]
-    cos, sin: [1, L, 1, D] or broadcastable
-    """
-    x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
-    rotated_x = jnp.stack([-x_reshaped[..., 1], x_reshaped[..., 0]], axis=-1)
-    rotated_x = rotated_x.reshape(x.shape)
-    return (x * cos) + (rotated_x * sin)
 
 
 class SelfAttention(nnx.Module):
@@ -154,7 +179,6 @@ class SelfAttention(nnx.Module):
         attn_weights = jnp.einsum('blhd,bshd->bhls', q, k) / math.sqrt(self.head_dim)
         
         if mask is not None:
-            # Broadcast mask appropriately depending on its shape
             attn_weights = jnp.where(mask, attn_weights, -1e9)
             
         attn = jax.nn.softmax(attn_weights, axis=-1)
@@ -203,10 +227,6 @@ class CrossAttention(nnx.Module):
         out = out.reshape(B, L, D)
         
         return self.out(out)
-
-
-def modulate(x, shift, scale):
-    return x * (1 + scale[:, None, :]) + shift[:, None, :]
 
 
 class DiTBlock(nnx.Module):
@@ -260,14 +280,6 @@ class DiTBlock(nnx.Module):
         x = x + gate_mlp[:, None, :] * self.mlp(x_mlp)
         
         return x
-@dataclasses.dataclass
-class DiTConfig:
-    dim: int
-    context_dim: int
-    num_heads: int
-    mlp_hidden_dim: int
-    num_blocks: int
-    frequency_embedding_size: int = 256
 
 
 class DiT(nnx.Module):
@@ -308,20 +320,19 @@ class DiT(nnx.Module):
         ])
         
         self.final_norm = nnx.LayerNorm(config.dim, rngs=rngs)
+        self.null_context = nnx.Param(
+            jax.random.normal(rngs(), (1, 1, config.context_dim)) * 0.02
+        )
         
-    def __call__(self, x, context, t, cos=None, sin=None, mask=None, context_mask=None):
-        """
-        Args:
-            x: shape [B, L, dim]
-            context: shape [B, S, context_dim]
-            t: shape [B]
-            cos: RoPE cosine embeddings
-            sin: RoPE sine embeddings
-            mask: Self-attention mask
-            context_mask: Cross-attention mask
-        Returns:
-            shape [B, L, dim]
-        """
+    def _forward(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None):
+        B, A, N, D = x.shape
+        x = flatten_action_patches(x)
+        
+        if obs_emb is not None:
+            # Expand to (B, 1, D) and prepend
+            obs_emb_exp = jnp.expand_dims(obs_emb, axis=1)
+            x = jnp.concatenate([obs_emb_exp, x], axis=1)
+        
         c = self.timestep_embedder(t)
         
         for block in self.blocks:
@@ -336,8 +347,50 @@ class DiT(nnx.Module):
             )
             
         x = self.final_norm(x)
+        
+        if obs_emb is not None:
+            x = x[:, 1:, :]
+            
+        x = unflatten_action_patches(x, A, N)
         return x
 
+    def predict_cond(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None):
+        """Forward pass with real context."""
+        return self._forward(x, obs_emb, context, t, cos, sin, mask, context_mask)
+        
+    def predict_uncond(self, x, obs_emb, context_shape, t, cos=None, sin=None, mask=None, context_mask=None):
+        """Forward pass with null context."""
+        null_ctx = jnp.broadcast_to(self.null_context[...], context_shape)
+        return self._forward(x, obs_emb, null_ctx, t, cos, sin, mask, context_mask)
+        
+    def cfg(self, x, obs_emb, context, t, cfg_scale=1.0, cos=None, sin=None, mask=None, context_mask=None):
+        """Combines predictions using classifier-free guidance."""
+        eps_cond = self.predict_cond(x, obs_emb, context, t, cos, sin, mask, context_mask)
+        eps_uncond = self.predict_uncond(x, obs_emb, context.shape, t, cos, sin, mask, context_mask)
+        return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+
+    def __call__(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None, 
+                 cond_drop_prob=0.0, rngs: nnx.Rngs = None):
+        """
+        Training forward pass with optional condition dropout.
+        Args:
+            x: shape [B, A, N, dim]
+            obs_emb: shape [B, dim] or None
+            context: shape [B, S, context_dim]
+            t: shape [B]
+        """
+        if cond_drop_prob > 0.0 and rngs is not None:
+            # Training with cond dropout
+            drop_mask = jax.random.bernoulli(rngs(), cond_drop_prob, (context.shape[0], 1, 1))
+            null_ctx = jnp.broadcast_to(self.null_context[...], context.shape)
+            context = jnp.where(drop_mask, null_ctx, context)
+            
+        return self._forward(x, obs_emb, context, t, cos, sin, mask, context_mask)
+
+
+# ==========================================
+# Testing block
+# ==========================================
 
 if __name__ == "__main__":
     # Test the DiT block
@@ -400,8 +453,25 @@ if __name__ == "__main__":
     k6, = jax.random.split(k5, 1)
     t = jax.random.uniform(k6, (B,))
     
-    out_dit = dit_model(x, context, t, cos=cos, sin=sin)
+    A, N = 4, 4
+    x_dit = x.reshape(B, A, N, dim)
     
-    print(f"Output shape:        {out_dit.shape}")
-    assert out_dit.shape == x.shape, f"DiT Output shape {out_dit.shape} does not match input shape {x.shape}!"
+    print("Testing conditional predict...")
+    out_cond = dit_model.predict_cond(x_dit, None, context, t, cos=cos, sin=sin)
+    print(f"Output cond shape:   {out_cond.shape}")
+    assert out_cond.shape == x_dit.shape
+    
+    print("Testing unconditional predict...")
+    out_uncond = dit_model.predict_uncond(x_dit, None, context.shape, t, cos=cos, sin=sin)
+    print(f"Output uncond shape: {out_uncond.shape}")
+    assert out_uncond.shape == x_dit.shape
+    
+    print("Testing CFG inference...")
+    out_cfg = dit_model.cfg(x_dit, None, context, t, cfg_scale=4.5, cos=cos, sin=sin)
+    assert out_cfg.shape == x_dit.shape
+    
+    print("Testing training forward with dropout...")
+    out_train = dit_model(x_dit, None, context, t, cos=cos, sin=sin, cond_drop_prob=0.5, rngs=rngs)
+    assert out_train.shape == x_dit.shape
+    
     print("DiT Test passed successfully!")

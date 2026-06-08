@@ -4,11 +4,13 @@ from dataclasses import dataclass, field, asdict
 @dataclass
 class TrainConfig:
     datasets_root: str = "data/datasets"
-    action_horizon: int = 8
+    action_horizon: int = 25
+    patch_size: int = 5
     batch_size: int = 100
     num_workers: int = 4
-    hidden_size: int = 192
+    hidden_size: int = 96
     learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
     dummy_vlm: bool = False
     wandb_project: str = "nanoVLA"
     jax_mem_fraction: str = ".70"
@@ -29,6 +31,8 @@ def parse_args() -> TrainConfig:
                         help=f"Path to datasets root directory (default: {default_config.datasets_root})")
     parser.add_argument("--action_horizon", type=int, default=default_config.action_horizon,
                         help=f"Action horizon (default: {default_config.action_horizon})")
+    parser.add_argument("--patch_size", type=int, default=default_config.patch_size,
+                        help=f"Patch size (default: {default_config.patch_size})")
     parser.add_argument("--batch_size", type=int, default=default_config.batch_size,
                         help=f"Batch size (default: {default_config.batch_size})")
     parser.add_argument("--num_workers", type=int, default=default_config.num_workers,
@@ -37,6 +41,8 @@ def parse_args() -> TrainConfig:
                         help=f"Hidden size for models (default: {default_config.hidden_size})")
     parser.add_argument("--learning_rate", type=float, default=default_config.learning_rate,
                         help=f"Learning rate (default: {default_config.learning_rate})")
+    parser.add_argument("--weight_decay", type=float, default=default_config.weight_decay,
+                        help=f"Weight decay (default: {default_config.weight_decay})")
     
     # Booleans are slightly tricky with argparse, but we can use simple string matching or store_true/store_false
     parser.add_argument("--dummy_vlm", type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=default_config.dummy_vlm,
@@ -66,10 +72,12 @@ def parse_args() -> TrainConfig:
     return TrainConfig(
         datasets_root=args.datasets_root,
         action_horizon=args.action_horizon,
+        patch_size=args.patch_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         hidden_size=args.hidden_size,
         learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
         dummy_vlm=args.dummy_vlm,
         wandb_project=args.wandb_project,
         jax_mem_fraction=args.jax_mem_fraction,
