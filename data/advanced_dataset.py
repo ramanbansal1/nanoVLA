@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
+from transformers import AutoTokenizer
 
 
 
@@ -44,11 +45,9 @@ class VideoDataset(Dataset):
         dataset,
         datasets_root,
         action_horizon,
-        vlm_context_root=None,
     ):
         self.dataset = dataset
         self.datasets_root = Path(datasets_root)
-        self.vlm_context_root = Path(vlm_context_root) if vlm_context_root else None
         self.action_horizon = action_horizon
 
         self.state_dim = len(
@@ -67,6 +66,10 @@ class VideoDataset(Dataset):
             end - start
             for start, end
             in self.episode_ranges.values()
+        )
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "google/siglip2-base-patch16-naflex"
         )
 
     def __len__(self):
@@ -125,20 +128,7 @@ class VideoDataset(Dataset):
 
         return images
 
-    def _load_vlm_context(self, row):
-        dataset_name = row["dataset_name"]
-        ep_id = row["episode_index"]
-        frame_idx = row["frame_index"]
-        
-        npy_path = self.vlm_context_root / dataset_name / f"{ep_id:06d}_{frame_idx:06d}.npy"
-        
-        if not npy_path.exists():
-            raise FileNotFoundError(f"Precomputed VLM context missing: {npy_path}")
-            
-        return torch.tensor(np.load(npy_path), dtype=torch.float32)
-
     def __getitem__(self, idx):
-
         row = self.dataset[idx]
 
         ep_id = row["episode_index"]
@@ -148,7 +138,6 @@ class VideoDataset(Dataset):
         )
 
         actions = []
-        eef_actions = []
         for k in range(self.action_horizon):
             target_idx = min(
                 idx + k,
@@ -156,13 +145,18 @@ class VideoDataset(Dataset):
             )
             target_row = self.dataset[target_idx]
             actions.append(target_row["action"])
-            eef_actions.append(target_row["eef_sim_pose_action"])
 
+        instruction = build_instruction(row["subtask_annotation"])
+        
         data = {
-            "instruction":
-                build_instruction(
-                    row["subtask_annotation"]
-                ),
+            "instruction": instruction,
+            "input_ids": self.tokenizer(
+                instruction,
+                padding="max_length",
+                truncation=True,
+                max_length=64,
+                return_tensors="np",
+            )["input_ids"][0],
 
             "observation_state":
                 torch.tensor(
@@ -170,21 +164,9 @@ class VideoDataset(Dataset):
                     dtype=torch.float32,
                 ),
 
-            "eef_state":
-                torch.tensor(
-                    row["eef_sim_pose_state"],
-                    dtype=torch.float32,
-                ),
-
             "action":
                 torch.tensor(
                     actions,
-                    dtype=torch.float32,
-                ),
-
-            "eef_action":
-                torch.tensor(
-                    eef_actions,
                     dtype=torch.float32,
                 ),
 
@@ -198,10 +180,7 @@ class VideoDataset(Dataset):
                 row["frame_index"],
         }
         
-        if self.vlm_context_root is not None:
-            data["vlm_context"] = self._load_vlm_context(row)
-        else:
-            data["images"] = self._load_images(row)
+        data["images"] = self._load_images(row)
             
         return data
         """

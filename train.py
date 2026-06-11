@@ -1,6 +1,10 @@
 #!.venv/bin/python
 import os
 import multiprocessing
+import time
+from rich.console import Console
+console = Console()
+
 try:
     multiprocessing.set_start_method('spawn', force=True)
 except RuntimeError:
@@ -11,7 +15,7 @@ import torch
 import torch.utils.dlpack
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
-from torchvision.transforms import ToTensor
+
 from datasets import load_dataset, concatenate_datasets, Value
 from pathlib import Path
 import wandb
@@ -22,7 +26,7 @@ from flax import nnx
 import optax
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
-from tqdm.auto import tqdm
+from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 
 from config import parse_args, asdict
 from data.advanced_dataset import VideoDataset
@@ -30,7 +34,6 @@ from models.vla import VLA
 
 
 def custom_collate_fn(batch):
-    to_tensor = ToTensor()
     collated = {}
 
     for key in batch[0].keys():
@@ -38,10 +41,10 @@ def custom_collate_fn(batch):
             imgs = []
             for item in batch:
                 first_cam = sorted(item["images"].keys())[0]
-                imgs.append(to_tensor(item["images"][first_cam]))
+                imgs.append(np.asarray(item["images"][first_cam]))
             collated["image"] = default_collate(imgs)
-        elif key == "instruction":
-            collated[key] = [item[key] for item in batch]
+        elif key == "input_ids":
+            collated[key] = default_collate([item[key] for item in batch])
         elif key != "images":
             collated[key] = default_collate([item[key] for item in batch])
 
@@ -49,11 +52,7 @@ def custom_collate_fn(batch):
 
 
 def torch_to_jax(t):
-    try:
-        t_cuda = t.cuda(non_blocking=True).contiguous()
-        return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t_cuda))
-    except Exception:
-        return jnp.array(t.contiguous().numpy())
+    return jax.dlpack.from_dlpack(t.contiguous())
 
 
 def prepare_datasets(datasets_root_dir):
@@ -95,13 +94,6 @@ def prepare_datasets(datasets_root_dir):
     return train_ds, val_ds, test_ds
 
 
-def setup_dataloader(config):
-    # Check VLM Context Path and fallback to dummy if missing
-    if config.vlm_context_dir and not os.path.exists(config.vlm_context_dir):
-        print(f"WARNING: VLM context directory '{config.vlm_context_dir}' not found. Falling back to dummy VLM.")
-        config.vlm_context_dir = None
-        config.dummy_vlm = True
-        
     train_ds, val_ds, test_ds = prepare_datasets(config.datasets_root)
     
     def make_loader(ds, is_train):
@@ -111,16 +103,15 @@ def setup_dataloader(config):
             dataset=ds,
             datasets_root=config.datasets_root,
             action_horizon=config.action_horizon,
-            vlm_context_root=config.vlm_context_dir,
         )
         return DataLoader(
             dataset, 
             batch_size=config.batch_size, 
             shuffle=is_train, 
-            pin_memory=True,
-            num_workers=config.num_workers,
+            pin_memory=False,
+            num_workers=config.num_workers if is_train else 0,
             collate_fn=custom_collate_fn,
-            drop_last=is_train
+            drop_last=True
         )
         
     train_loader = make_loader(train_ds, True)
@@ -132,9 +123,10 @@ def setup_dataloader(config):
           f"{len(test_loader.dataset) if test_loader else 0} items for test.")
     
     sample_item = train_loader.dataset.dataset[0]
-    obs_dim = len(sample_item["observation.state"]) + len(sample_item["eef_sim_pose_state"])
+    obs_dim = len(sample_item["observation.state"])
+    action_dim = len(sample_item["action"])
     
-    return train_loader, val_loader, test_loader, obs_dim
+    return train_loader, val_loader, test_loader, obs_dim, action_dim
 
 
 def loss_fn(model, vlm_out, observation, action, t, noise_key):
@@ -151,9 +143,9 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key):
     # 4. Target Velocity in raw space
     target_v = x_1 - x_0
     
-    vlm_modulated, action_proj, _, obs_emb, dit_out, pred_v_raw, decoded_actions = model(
+    pred_v_raw = model(
         images=None, 
-        instruction=None, 
+        input_ids=None, 
         observation=observation, 
         action=x_t,
         t=t,
@@ -162,7 +154,7 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key):
     
     # 5. MSE Loss on raw velocity
     loss_val = jnp.mean((pred_v_raw - target_v) ** 2)
-    return loss_val, (pred_v_raw, target_v, x_t, decoded_actions)
+    return loss_val, (pred_v_raw, target_v, x_t)
 
 
 @nnx.jit
@@ -170,7 +162,9 @@ def train_step(model, optimizer, vlm_out, observation, action, t, noise_key):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     (loss_val, aux), grads = grad_fn(model, vlm_out, observation, action, t, noise_key)
     optimizer.update(model, grads)
-    return loss_val, aux, grads
+    
+    grad_norm = optax.global_norm(grads)
+    return loss_val, aux, grad_norm
 
 
 @nnx.jit
@@ -181,38 +175,49 @@ def eval_step(model, vlm_out, observation, action, t, noise_key):
 
 def main():
     config = parse_args()
-    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = config.jax_mem_fraction
     
     wandb.init(project=config.wandb_project, config=asdict(config))
     
-    train_loader, val_loader, test_loader, obs_dim = setup_dataloader(config)
+    train_loader, val_loader, test_loader, obs_dim, action_dim = setup_dataloader(config)
     
     rngs = nnx.Rngs(42)
     vla = VLA(
         hidden_size=config.hidden_size, 
         obs_dim=obs_dim, 
         rngs=rngs, 
-        dummy=config.dummy_vlm,
         dit_num_blocks=config.dit_num_blocks,
         vla_k=config.vla_k,
         patch_size=config.patch_size,
-        horizon=config.action_horizon
+        horizon=config.action_horizon,
+        action_dim=action_dim,
+        vlm_checkpoint_path=config.vlm_checkpoint_path
     )
     
     num_params = sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(vla, nnx.Param)))
     print(f"Model initialized with {num_params:,} trainable parameters.")
     wandb.config.update({"num_trainable_params": num_params})
 
+    num_train_steps = config.num_epochs * len(train_loader)
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config.learning_rate,
+        warmup_steps=500,
+        decay_steps=num_train_steps,
+    )
+    
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.nadamw(learning_rate=config.learning_rate, weight_decay=config.weight_decay)
+        optax.nadamw(learning_rate=schedule, weight_decay=config.weight_decay)
     )
     optimizer = nnx.Optimizer(vla, tx, wrt=nnx.Param)
 
-    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+    ema_decay = 0.999
+    ema_state = nnx.state(vla, nnx.Param)
+
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True, enable_async_checkpointing=False)
     checkpoint_manager = ocp.CheckpointManager(
         os.path.abspath(config.checkpoint_dir),
-        item_names=("model_state", "optimizer_state"),
+        item_names=("model_state", "optimizer_state", "ema_state"),
         options=options
     )
 
@@ -221,118 +226,136 @@ def main():
     batch_sharding = NamedSharding(mesh, PartitionSpec("data"))
 
     global_step = 0
-    for epoch in range(config.num_epochs):
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
-        for step, batch in enumerate(train_pbar):
-        
-            if 'vlm_context' in batch:
-                vlm_out = torch_to_jax(batch['vlm_context'])
-                images_jnp = None
-            else:
+    
+    with jax.set_mesh(mesh):
+        for epoch in range(config.num_epochs):
+            console.print(f"\n[bold cyan]=== Epoch {epoch+1}/{config.num_epochs} ===[/bold cyan]")
+            
+            for step, batch in enumerate(train_loader):
+                t0 = time.time()
+            
                 images_jnp = torch_to_jax(batch['image'])
-                vlm_out = None
                 
-            instruction = batch['instruction'][0]  # Take first instruction since batch_size=1
-            
-            observation_jnp = torch_to_jax(batch['observation_state'])
-            eef_state_jnp = torch_to_jax(batch['eef_state'])
-            observation_jnp = jnp.concatenate([observation_jnp, eef_state_jnp], axis=-1)
-            
-            action_jnp = torch_to_jax(batch['action'])
-            eef_action_jnp = torch_to_jax(batch['eef_action'])
-            action_jnp = jnp.concatenate([action_jnp, eef_action_jnp], axis=-1)
-            
-            key = jax.random.PRNGKey(global_step)
-            key, noise_key, t_key = jax.random.split(key, 3)
-            t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
-            
-            if vlm_out is None:
-                vlm_out = vla.vlm(images_jnp, instruction)
-            
-            with jax.set_mesh(mesh):
+                input_ids = batch['input_ids']  # This is a PyTorch tensor now because of default_collate
+                input_ids_jnp = torch_to_jax(input_ids)
+                
+                observation_jnp = torch_to_jax(batch['observation_state'])
+                action_jnp = torch_to_jax(batch['action'])
+                
+                key = jax.random.PRNGKey(epoch * len(train_loader) + step)
+                key, noise_key, t_key = jax.random.split(key, 3)
+                t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
+                
+                t1 = time.time()
+                img_embs = jnp.asarray(vla.vlm.encode_images(images_jnp))
+                txt_embs = jnp.asarray(vla.vlm.encode_texts(input_ids_jnp))
+                vlm_out = jnp.concatenate([txt_embs[:, None, :], img_embs[:, None, :]], axis=1)
+                t2 = time.time()
+                
                 vlm_out = jax.device_put(vlm_out, batch_sharding)
                 observation_jnp = jax.device_put(observation_jnp, batch_sharding)
                 action_jnp = jax.device_put(action_jnp, batch_sharding)
                 t = jax.device_put(t, batch_sharding)
+                t3 = time.time()
                 
-                loss_val, aux, grads = train_step(vla, optimizer, vlm_out, observation_jnp, action_jnp, t, noise_key)
-            
-            pred_v_raw, target_v_raw, x_t, decoded_actions = aux
-            
-            loss_val = jax.block_until_ready(loss_val)
-            
-            grad_norm = jnp.sqrt(sum([jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads)]))
-            mean_pred_v = jnp.mean(pred_v_raw)
-            mean_target_v = jnp.mean(target_v_raw)
-
-            log_dict = {
-                "train/loss": float(loss_val),
-                "train/grad_norm": float(grad_norm),
-                "train/mean_pred_v": float(mean_pred_v),
-                "train/mean_target_v": float(mean_target_v),
-                "epoch": epoch + 1
-            }
-            
-            wandb.log(log_dict, step=global_step)
-            train_pbar.set_postfix({
-                "loss": f"{float(loss_val):.4f}",
-                "grad": f"{float(grad_norm):.3f}",
-            })
-            
-            if global_step % config.save_every == 0 and global_step > 0:
-                _, model_state = nnx.split(vla)
-                _, opt_state = nnx.split(optimizer)
-                checkpoint_manager.save(
-                    global_step, 
-                    args=ocp.args.Composite(
-                        model_state=ocp.args.StandardSave(model_state),
-                        optimizer_state=ocp.args.StandardSave(opt_state)
-                    )
+                loss_val, aux, grad_norm = train_step(vla, optimizer, vlm_out, observation_jnp, action_jnp, t, noise_key)
+                
+                # Update EMA state
+                ema_state = jax.tree_util.tree_map(
+                    lambda ema, param: ema_decay * ema + (1 - ema_decay) * param,
+                    ema_state, nnx.state(vla, nnx.Param)
                 )
-                checkpoint_manager.wait_until_finished()
                 
-            if global_step % 100 == 0 and global_step > 0 and val_loader is not None:
-                val_losses = []
-                for val_batch in val_loader:
-                    if 'vlm_context' in val_batch:
-                        val_vlm_out = torch_to_jax(val_batch['vlm_context'])
-                        val_images_jnp = None
-                    else:
+                t4 = time.time()
+                pred_v_raw, target_v_raw, x_t = aux
+                
+                loss_val = jax.block_until_ready(loss_val)
+                t5 = time.time()
+                
+                if step < 5 or step % 50 == 0:
+                    console.print(f"[bold cyan]Step {step}[/bold cyan] [dim]Profiling | Prep: {t1-t0:.4f}s | VLM: {t2-t1:.4f}s | DevicePut: {t3-t2:.4f}s | JIT Execute: {t5-t3:.4f}s[/dim]")
+                
+                mean_pred_v = jnp.mean(pred_v_raw)
+                mean_target_v = jnp.mean(target_v_raw)
+    
+                log_dict = {
+                    "train/loss": float(loss_val),
+                    "train/grad_norm": float(grad_norm),
+                    "train/mean_pred_v": float(mean_pred_v),
+                    "train/mean_target_v": float(mean_target_v),
+                    "epoch": epoch + 1
+                }
+                
+                wandb.log(log_dict, step=global_step)
+                
+                if step % 100 == 0:
+                    console.print(f"[dim]Step {global_step} | Loss: {float(loss_val):.4f} | Grad: {float(grad_norm):.3f}[/dim]")
+                
+                if global_step % config.save_every == 0 and global_step > 0:
+                    console.print(f"\n[bold yellow]Step {global_step}: Saving Checkpoint...[/bold yellow]")
+                    model_state = nnx.state(vla)
+                    opt_state = nnx.state(optimizer)
+                    checkpoint_manager.save(
+                        global_step, 
+                        args=ocp.args.Composite(
+                            model_state=ocp.args.StandardSave(model_state),
+                            optimizer_state=ocp.args.StandardSave(opt_state),
+                            ema_state=ocp.args.StandardSave(ema_state)
+                        )
+                    )
+                    checkpoint_manager.wait_until_finished()
+                    console.print(f"[bold green]Step {global_step}: Checkpoint Saved![/bold green]")
+                    
+                if global_step % 100 == 0 and global_step > 0 and val_loader is not None:
+                    console.print(f"\n[bold yellow]Step {global_step}: Starting Validation...[/bold yellow]")
+                    val_losses = []
+                    
+                    # Swap to EMA weights for validation
+                    current_state = nnx.state(vla, nnx.Param)
+                    nnx.update(vla, ema_state)
+                    
+                    MAX_VAL_BATCHES = 50
+                    for val_idx, val_batch in enumerate(val_loader):
+                        if val_idx >= MAX_VAL_BATCHES:
+                            break
+                            
                         val_images_jnp = torch_to_jax(val_batch['image'])
-                        val_vlm_out = None
+                            
+                        val_input_ids = val_batch['input_ids']
+                        val_input_ids_jnp = torch_to_jax(val_input_ids)
                         
-                    val_instruction = val_batch['instruction'][0]
-                    
-                    val_observation_jnp = torch_to_jax(val_batch['observation_state'])
-                    val_eef_state_jnp = torch_to_jax(val_batch['eef_state'])
-                    val_observation_jnp = jnp.concatenate([val_observation_jnp, val_eef_state_jnp], axis=-1)
-                    
-                    val_action_jnp = torch_to_jax(val_batch['action'])
-                    val_eef_action_jnp = torch_to_jax(val_batch['eef_action'])
-                    val_action_jnp = jnp.concatenate([val_action_jnp, val_eef_action_jnp], axis=-1)
-                    
-                    val_key = jax.random.PRNGKey(global_step)
-                    val_key, val_noise_key, val_t_key = jax.random.split(val_key, 3)
-                    val_t = jax.random.uniform(val_t_key, shape=(val_action_jnp.shape[0],))
-                    
-                    if val_vlm_out is None:
-                        val_vlm_out = vla.vlm(val_images_jnp, val_instruction)
-                    
-                    with jax.set_mesh(mesh):
+                        val_observation_jnp = torch_to_jax(val_batch['observation_state'])
+                        val_action_jnp = torch_to_jax(val_batch['action'])
+                        
+                        val_key = jax.random.PRNGKey(epoch * len(val_loader) + val_idx)
+                        val_key, val_noise_key, val_t_key = jax.random.split(val_key, 3)
+                        val_t = jax.random.uniform(val_t_key, shape=(val_action_jnp.shape[0],))
+                        
+                        val_img_embs = jnp.asarray(vla.vlm.encode_images(val_images_jnp))
+                        val_txt_embs = jnp.asarray(vla.vlm.encode_texts(val_input_ids_jnp))
+                        val_vlm_out = jnp.concatenate([val_txt_embs[:, None, :], val_img_embs[:, None, :]], axis=1)
+                        
                         val_vlm_out = jax.device_put(val_vlm_out, batch_sharding)
                         val_observation_jnp = jax.device_put(val_observation_jnp, batch_sharding)
                         val_action_jnp = jax.device_put(val_action_jnp, batch_sharding)
                         val_t = jax.device_put(val_t, batch_sharding)
                         
+                        if global_step == 100 and val_idx == 0:
+                            console.print("[bold cyan]Note: JAX is compiling the validation step for the first time. This may take 3-5 minutes...[/bold cyan]")
+                            
                         val_loss_val, _ = eval_step(vla, val_vlm_out, val_observation_jnp, val_action_jnp, val_t, val_noise_key)
-                    val_losses.append(float(val_loss_val))
-                
-                if val_losses:
-                    mean_val_loss = float(np.mean(val_losses))
-                    print(f"\nStep {global_step} - Validation Loss (MSE): {mean_val_loss:.4f}")
-                    wandb.log({"val/loss": mean_val_loss}, step=global_step)
-                
-            global_step += 1
+                        val_loss_val = jax.block_until_ready(val_loss_val)
+                        val_losses.append(float(val_loss_val))
+                    
+                    # Restore live model weights
+                    nnx.update(vla, current_state)
+                    
+                    if val_losses:
+                        mean_val_loss = float(np.mean(val_losses))
+                        console.print(f"[bold magenta]Step {global_step} - Validation Loss (MSE): {mean_val_loss:.4f}[/bold magenta]\n")
+                        wandb.log({"val/loss": mean_val_loss}, step=global_step)
+                    
+                global_step += 1
 
 if __name__ == "__main__":
     main()

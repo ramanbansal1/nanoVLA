@@ -10,25 +10,7 @@ from flax import nnx
 # Helper Functions
 # ==========================================
 
-def flatten_action_patches(x):
-    """
-    (B, A, N, D) -> (B, N, A, D) -> (B, N*A, D)
-    """
-    B, A, N, D = x.shape
-    x = jnp.transpose(x, (0, 2, 1, 3))
-    x = jnp.reshape(x, (B, N * A, D))
-    return x
 
-
-def unflatten_action_patches(x, A, N):
-    """
-    (B, N*A, D) -> (B, N, A, D) -> (B, A, N, D)
-    """
-    B, L, D = x.shape
-    assert L == N * A, f"Sequence length {L} does not match N*A ({N}*{A})"
-    x = jnp.reshape(x, (B, N, A, D))
-    x = jnp.transpose(x, (0, 2, 1, 3))
-    return x
 
 
 def apply_rope(x, cos, sin):
@@ -324,10 +306,22 @@ class DiT(nnx.Module):
             jax.random.normal(rngs(), (1, 1, config.context_dim)) * 0.02
         )
         
-    def _forward(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None):
-        B, A, N, D = x.shape
-        x = flatten_action_patches(x)
-        
+    def __call__(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None, 
+                 cond_drop_prob=0.0, rngs: nnx.Rngs = None):
+        """
+        Training forward pass with optional condition dropout.
+        Args:
+            x: shape [B, N, dim]
+            obs_emb: shape [B, dim] or None
+            context: shape [B, S, context_dim]
+            t: shape [B]
+        """
+        if cond_drop_prob > 0.0 and rngs is not None:
+            # Training with cond dropout
+            drop_mask = jax.random.bernoulli(rngs(), cond_drop_prob, (context.shape[0], 1, 1))
+            null_ctx = jnp.broadcast_to(self.null_context[...], context.shape)
+            context = jnp.where(drop_mask, null_ctx, context)
+            
         if obs_emb is not None:
             # Expand to (B, 1, D) and prepend
             obs_emb_exp = jnp.expand_dims(obs_emb, axis=1)
@@ -336,7 +330,7 @@ class DiT(nnx.Module):
         c = self.timestep_embedder(t)
         
         for block in self.blocks:
-            x = nnx.remat(block)(
+            x = block(
                 x=x, 
                 context=context, 
                 c=c, 
@@ -351,41 +345,21 @@ class DiT(nnx.Module):
         if obs_emb is not None:
             x = x[:, 1:, :]
             
-        x = unflatten_action_patches(x, A, N)
         return x
 
-    def predict_cond(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None):
-        """Forward pass with real context."""
-        return self._forward(x, obs_emb, context, t, cos, sin, mask, context_mask)
-        
-    def predict_uncond(self, x, obs_emb, context_shape, t, cos=None, sin=None, mask=None, context_mask=None):
-        """Forward pass with null context."""
-        null_ctx = jnp.broadcast_to(self.null_context[...], context_shape)
-        return self._forward(x, obs_emb, null_ctx, t, cos, sin, mask, context_mask)
-        
-    def cfg(self, x, obs_emb, context, t, cfg_scale=1.0, cos=None, sin=None, mask=None, context_mask=None):
-        """Combines predictions using classifier-free guidance."""
-        eps_cond = self.predict_cond(x, obs_emb, context, t, cos, sin, mask, context_mask)
-        eps_uncond = self.predict_uncond(x, obs_emb, context.shape, t, cos, sin, mask, context_mask)
-        return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 
-    def __call__(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None, 
-                 cond_drop_prob=0.0, rngs: nnx.Rngs = None):
-        """
-        Training forward pass with optional condition dropout.
-        Args:
-            x: shape [B, A, N, dim]
-            obs_emb: shape [B, dim] or None
-            context: shape [B, S, context_dim]
-            t: shape [B]
-        """
-        if cond_drop_prob > 0.0 and rngs is not None:
-            # Training with cond dropout
-            drop_mask = jax.random.bernoulli(rngs(), cond_drop_prob, (context.shape[0], 1, 1))
-            null_ctx = jnp.broadcast_to(self.null_context[...], context.shape)
-            context = jnp.where(drop_mask, null_ctx, context)
-            
-        return self._forward(x, obs_emb, context, t, cos, sin, mask, context_mask)
+# ==========================================
+# Inference Utilities
+# ==========================================
+
+def inference_cfg(model: DiT, x, obs_emb, context, t, cfg_scale=1.0, cos=None, sin=None, mask=None, context_mask=None):
+    """Combines predictions using classifier-free guidance."""
+    eps_cond = model(x, obs_emb, context, t, cos=cos, sin=sin, mask=mask, context_mask=context_mask)
+    
+    null_ctx = jnp.broadcast_to(model.null_context[...], context.shape)
+    eps_uncond = model(x, obs_emb, null_ctx, t, cos=cos, sin=sin, mask=mask, context_mask=context_mask)
+    
+    return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 
 
 # ==========================================
@@ -453,21 +427,21 @@ if __name__ == "__main__":
     k6, = jax.random.split(k5, 1)
     t = jax.random.uniform(k6, (B,))
     
-    A, N = 4, 4
-    x_dit = x.reshape(B, A, N, dim)
+    x_dit = x
     
     print("Testing conditional predict...")
-    out_cond = dit_model.predict_cond(x_dit, None, context, t, cos=cos, sin=sin)
+    out_cond = dit_model(x_dit, None, context, t, cos=cos, sin=sin)
     print(f"Output cond shape:   {out_cond.shape}")
     assert out_cond.shape == x_dit.shape
     
     print("Testing unconditional predict...")
-    out_uncond = dit_model.predict_uncond(x_dit, None, context.shape, t, cos=cos, sin=sin)
+    null_ctx = jnp.broadcast_to(dit_model.null_context[...], context.shape)
+    out_uncond = dit_model(x_dit, None, null_ctx, t, cos=cos, sin=sin)
     print(f"Output uncond shape: {out_uncond.shape}")
     assert out_uncond.shape == x_dit.shape
     
     print("Testing CFG inference...")
-    out_cfg = dit_model.cfg(x_dit, None, context, t, cfg_scale=4.5, cos=cos, sin=sin)
+    out_cfg = inference_cfg(dit_model, x_dit, None, context, t, cfg_scale=4.5, cos=cos, sin=sin)
     assert out_cfg.shape == x_dit.shape
     
     print("Testing training forward with dropout...")

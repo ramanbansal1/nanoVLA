@@ -11,15 +11,13 @@ class TrainConfig:
     hidden_size: int = 96
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-    dummy_vlm: bool = False
     wandb_project: str = "nanoVLA"
-    jax_mem_fraction: str = ".70"
     num_epochs: int = 30
     save_every: int = 100
     checkpoint_dir: str = "checkpoints/nanoVLA"
     dit_num_blocks: int = 4
     vla_k: int = 4
-    vlm_context_dir: str = "data/vlm_context"
+    vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz"
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="nanoVLA Training Configuration")
@@ -44,15 +42,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--weight_decay", type=float, default=default_config.weight_decay,
                         help=f"Weight decay (default: {default_config.weight_decay})")
     
-    # Booleans are slightly tricky with argparse, but we can use simple string matching or store_true/store_false
-    parser.add_argument("--dummy_vlm", type=lambda x: (str(x).lower() in ['true', '1', 'yes']), default=default_config.dummy_vlm,
-                        help=f"Use dummy VLM for fast testing (default: {default_config.dummy_vlm})")
-    
     parser.add_argument("--wandb_project", type=str, default=default_config.wandb_project,
                         help=f"W&B project name (default: {default_config.wandb_project})")
-    
-    parser.add_argument("--jax_mem_fraction", type=str, default=default_config.jax_mem_fraction,
-                        help=f"XLA_PYTHON_CLIENT_MEM_FRACTION (default: {default_config.jax_mem_fraction})")
     
     parser.add_argument("--num_epochs", type=int, default=default_config.num_epochs,
                         help=f"Number of training epochs (default: {default_config.num_epochs})")
@@ -64,8 +55,8 @@ def parse_args() -> TrainConfig:
                         help=f"Number of DiT blocks (default: {default_config.dit_num_blocks})")
     parser.add_argument("--vla_k", type=int, default=default_config.vla_k,
                         help=f"Number of flow matching iterations K (default: {default_config.vla_k})")
-    parser.add_argument("--vlm_context_dir", type=str, default=default_config.vlm_context_dir,
-                        help=f"Directory containing precomputed VLM embeddings (default: {default_config.vlm_context_dir})")
+    parser.add_argument("--vlm_checkpoint_path", type=str, default=default_config.vlm_checkpoint_path,
+                        help=f"Path to VLM checkpoint (default: {default_config.vlm_checkpoint_path})")
     
     args = parser.parse_args()
     
@@ -78,13 +69,11 @@ def parse_args() -> TrainConfig:
         hidden_size=args.hidden_size,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        dummy_vlm=args.dummy_vlm,
         wandb_project=args.wandb_project,
-        jax_mem_fraction=args.jax_mem_fraction,
         num_epochs=args.num_epochs,
         save_every=args.save_every,
         checkpoint_dir=args.checkpoint_dir,
         dit_num_blocks=args.dit_num_blocks,
         vla_k=args.vla_k,
-        vlm_context_dir=args.vlm_context_dir
+        vlm_checkpoint_path=args.vlm_checkpoint_path
     )

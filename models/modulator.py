@@ -3,55 +3,60 @@ import jax.numpy as jnp
 from flax import nnx
 
 class Modulator(nnx.Module):
-    def __init__(self, dim: int, num_splits: int, rngs: nnx.Rngs):
+    def __init__(self, in_dim: int, out_dim: int, num_splits: int, rngs: nnx.Rngs):
         """
         Args:
-            dim: The input dimension size (d). Must be divisible by num_splits.
-            num_splits: The number of parts to split the input into.
+            in_dim: The input dimension size (e.g., 512 from VLM).
+            out_dim: The projected dimension size (e.g., 576).
+            num_splits: The number of tokens to split each projected token into.
             rngs: NNX Rngs object for initialization.
         """
-        if dim % num_splits != 0:
-            raise ValueError(f"Input dimension must be divisible by {num_splits}, got {dim}")
+        if out_dim % num_splits != 0:
+            raise ValueError(f"Projected dimension must be divisible by {num_splits}, got {out_dim}")
             
-        self.dim = dim
+        self.in_dim = in_dim
+        self.out_dim = out_dim
         self.num_splits = num_splits
-        # Linear layer to produce scores for the splits
-        self.score_proj = nnx.Linear(dim, num_splits, rngs=rngs)
+        
+        # Linear layer to project the input to the target dimension
+        self.proj = nnx.Linear(in_dim, out_dim, rngs=rngs)
         
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """
         Args:
-            x: input array of shape [b, s, d]
+            x: input array of shape [B, S, in_dim]
             
         Returns:
-            Weighted sum of the splits, shape [b, s, d // num_splits]
+            Projected, GELU-activated, and split array of shape [B, S * num_splits, out_dim // num_splits]
         """
-        # 1. Compute scores: shape [b, s, num_splits]
-        scores = self.score_proj(x)
+        # 1. Project: [B, S, in_dim] -> [B, S, out_dim]
+        x = self.proj(x)
         
-        # 2. Normalize scores to weights using softmax
-        weights = jax.nn.softmax(scores, axis=-1)  # shape [b, s, num_splits]
+        # 2. GELU activation
+        x = nnx.gelu(x)
         
-        # 3. Split input into parts along the last dimension
-        splits = jnp.split(x, self.num_splits, axis=-1)
+        # 3. Split into tokens: [B, S, out_dim] -> [B, S * num_splits, out_dim // num_splits]
+        B, S, _ = x.shape
+        split_dim = self.out_dim // self.num_splits
+        x = x.reshape(B, S * self.num_splits, split_dim)
         
-        # 4. Compute the weighted split dynamically
-        weighted_out = sum([weights[..., i:i+1] * splits[i] for i in range(self.num_splits)])
-                        
-        return weighted_out
+        return x
 
 if __name__ == "__main__":
     # Simple test for the Modulator
     rngs = nnx.Rngs(0)
     
-    b, s, d = 2, 4, 12
-    x = jax.random.normal(rngs.next(), (b, s, d))
+    b, s, in_dim = 2, 2, 512
+    out_dim = 576
+    num_splits = 6
     
-    num_splits = 3
-    modulator = Modulator(dim=d, num_splits=num_splits, rngs=rngs)
+    x = jax.random.normal(rngs.next(), (b, s, in_dim))
+    
+    modulator = Modulator(in_dim=in_dim, out_dim=out_dim, num_splits=num_splits, rngs=rngs)
     
     out = modulator(x)
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {out.shape}")
-    assert out.shape == (b, s, d // num_splits), "Output shape is incorrect!"
+    expected_shape = (b, s * num_splits, out_dim // num_splits)
+    assert out.shape == expected_shape, f"Output shape {out.shape} != {expected_shape}"
     print("Modulator test passed!")

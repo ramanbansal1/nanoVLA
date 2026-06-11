@@ -1,3 +1,16 @@
+import os
+import sys
+
+# Allow running this file directly by appending project root to sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import os
+
+import sys
+
+# Allow running this file directly by appending project root to sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -8,100 +21,24 @@ from flax import nnx
 from models.action_state_proj import ActionProjector, ActionUnembed, ObsProjector
 from models.modulator import Modulator
 from models.DiT import DiT, DiTConfig
-
-class VLM:
-    def __init__(self, model_id="HuggingFaceTB/SmolVLM-256M-Instruct", device=None, dummy: bool = False):
-        self.device = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-        self.dummy = dummy
-        self.model_id = model_id
-        
-        if not self.dummy:
-            self.processor = AutoProcessor.from_pretrained(model_id)
-            self.model = AutoModelForVision2Seq.from_pretrained(
-                model_id,
-                torch_dtype=torch.bfloat16,
-            ).to(self.device)
-            self.model.eval()
-        else:
-            print(f"Initializing Dummy VLM for fast testing (mocking {model_id})...")
-
-    def __call__(self, images: jnp.ndarray, instruction: str) -> jnp.ndarray:
-        """
-        Passes an image and instruction through the VLM to get multimodal hidden states.
-        
-        Args:
-            images: (B, H, W, C) array of images.
-            instruction: string or list of strings containing instructions.
-            
-        Returns:
-            last_hidden_jnp: (B, seq_len, hidden_dim) array of hidden states.
-        """
-        if self.dummy:
-            images_np = np.array(images)
-            is_batch = images_np.ndim == 4
-            batch_size = images_np.shape[0] if is_batch else 1
-            key = jax.random.PRNGKey(np.random.randint(0, 10000))
-            return jax.random.normal(key, (batch_size, 50, 576))
-
-        images_np = np.array(images)
-        is_batch = True
-        if images_np.ndim == 3:
-            images_list = [images_np]
-            is_batch = False
-        elif images_np.ndim == 4:
-            images_list = [img for img in images_np]
-        else:
-            raise ValueError(f"Expected images to be 3D or 4D, got {images_np.ndim}D")
-
-        messages = []
-        for i in range(len(images_list)):
-            inst = instruction[i] if isinstance(instruction, list) else instruction
-            messages.append([
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": inst},
-                    ],
-                }
-            ])
-
-        prompts = [self.processor.apply_chat_template(msg, add_generation_prompt=True) for msg in messages]
-        inputs = self.processor(
-            text=prompts if is_batch else prompts[0],
-            images=images_list if is_batch else images_list[0],
-            return_tensors="pt",
-            padding=True,
-            do_rescale=False,
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-
-        last_hidden = outputs.hidden_states[-1].contiguous().detach()
-        try:
-            last_hidden_jnp = jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(last_hidden))
-        except Exception:
-            last_hidden_jnp = jnp.array(last_hidden.cpu().to(torch.float32).numpy())
-            
-        return last_hidden_jnp
-
+from models.visual_encoder import SigLIP
 
 class VLA(nnx.Module):
-    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, vlm_dim: int = 576, dummy: bool = False, dit_num_blocks: int = 4, vla_k: int = 4, patch_size: int = 5, action_dim: int = 43, horizon: int = 120):
+    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, vlm_dim: int = 576, dit_num_blocks: int = 4, vla_k: int = 4, patch_size: int = 5, action_dim: int = 43, horizon: int = 120, vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz"):
         self.hidden_size = hidden_size
         self.vla_k = vla_k
         self.patch_size = patch_size
         self.action_dim = action_dim
         self.horizon = horizon
-        self.vlm = VLM(dummy=dummy)
+        
+        self.vlm = SigLIP(checkpoint_path=vlm_checkpoint_path, normalize=True)
+
         
         self.num_splits = 6
-        self.vlm_proj = nnx.Linear(vlm_dim, hidden_size * self.num_splits, rngs=rngs)
-        self.modulator = Modulator(dim=hidden_size * self.num_splits, num_splits=self.num_splits, rngs=rngs)
+        self.modulator = Modulator(in_dim=768, out_dim=vlm_dim, num_splits=self.num_splits, rngs=rngs)
         
-        self.action_projector = ActionProjector(patch_size=patch_size, hidden_size=hidden_size, rngs=rngs)
-        self.action_unembed = ActionUnembed(hidden_size=hidden_size, patch_size=patch_size, rngs=rngs)
+        self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, rngs=rngs)
+        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, patch_size=patch_size, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
         
         dit_config = DiTConfig(
@@ -131,13 +68,13 @@ class VLA(nnx.Module):
         sin = jnp.concatenate([obs_sin, action_sin], axis=1)
         return cos, sin
 
-    def __call__(self, images, instruction, observation, action=None, t=None, vlm_out=None, key=None, cond_drop_prob=0.0, rngs=None):
+    def __call__(self, images, input_ids, observation, action=None, t=None, vlm_out=None, key=None, cond_drop_prob=0.0, rngs=None):
         """
         Executes the Vision-Language-Action forward pass, or K-step flow matching if action is None.
         
         Args:
-            images: (B, H, W, C) array of images.
-            instruction: string or list of instructions.
+            images: (B, H, W, C) array of images or PIL images.
+            input_ids: (B, 64) array of text token indices.
             observation: (B, obs_dim) array of robot state.
             action: (B, horizon, action_dim) array of continuous actions (can be noisy x_t).
             t: (B,) array of timesteps (for training).
@@ -147,13 +84,14 @@ class VLA(nnx.Module):
             rngs: NNX PRNG state for training dropout.
             
         Returns:
-            Tuple containing modulated VLM features, projected actions, None, obs_emb, dit_out, un-embedded actions, decoded actions.
+            pred_v_raw for training, or x_t for inference.
         """
         if vlm_out is None:
-            vlm_out = self.vlm(images, instruction)
+            img_embs = jnp.asarray(self.vlm.encode_images(images))
+            txt_embs = jnp.asarray(self.vlm.encode_texts(input_ids))
+            vlm_out = jnp.concatenate([txt_embs[:, None, :], img_embs[:, None, :]], axis=1)
         
-        vlm_proj_out = self.vlm_proj(vlm_out)
-        vlm_modulated = self.modulator(vlm_proj_out)
+        vlm_modulated = self.modulator(vlm_out)
         obs_emb = self.obs_projector(observation)
         
         # Training Mode
@@ -162,9 +100,9 @@ class VLA(nnx.Module):
             
             action_proj = self.action_projector(action)
                 
-            _, A, N, _ = action_proj.shape
+            _, N, _ = action_proj.shape
             
-            seq_len = A * N + 1
+            seq_len = N + 1
             cos, sin = self._get_rope(seq_len)
             
             if t is None:
@@ -183,7 +121,7 @@ class VLA(nnx.Module):
             )
             
             pred_v_raw = self.action_unembed(dit_out)
-            return vlm_modulated, action_proj, None, obs_emb, dit_out, pred_v_raw, None
+            return pred_v_raw
             
         # Inference / Generation Mode (Continuous Flow Matching Euler steps)
         else:
@@ -197,7 +135,7 @@ class VLA(nnx.Module):
             key, subkey = jax.random.split(key)
             x_t = jax.random.normal(subkey, (B, self.horizon, self.action_dim))
             
-            seq_len = self.action_dim * N + 1
+            seq_len = N + 1
             cos, sin = self._get_rope(seq_len)
             
             dt = 1.0 / self.vla_k
@@ -223,4 +161,4 @@ class VLA(nnx.Module):
                 
                 x_t = x_t + v_pred_raw * dt
                 
-            return vlm_modulated, x_t, None, obs_emb, v_pred_raw, None, x_t
+            return x_t
