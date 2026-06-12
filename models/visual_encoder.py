@@ -46,6 +46,10 @@ class SigLIP:
         self.tokenizer = AutoTokenizer.from_pretrained(
             "google/siglip2-base-patch16-naflex"
         )
+        from transformers import AutoProcessor
+        self.processor = AutoProcessor.from_pretrained(
+            "google/siglip2-base-patch16-naflex"
+        )
 
         # ==================================================
         # IMAGE MODEL
@@ -170,90 +174,26 @@ class SigLIP:
     # IMAGE PREPROCESSING
     # ======================================================
 
-    @staticmethod
-    def image_to_naflex(image):
-        if isinstance(image, Image.Image):
-            image = image.convert("RGB")
-            image = image.resize(
-                (256, 256),
-                Image.BICUBIC,
-            )
-            image = np.asarray(
-                image,
-                dtype=np.float32,
-            )
-        else:
-            image = np.asarray(
-                image,
-                dtype=np.float32,
-            )
-
-            if image.shape[:2] != (256, 256):
-                image = np.asarray(
-                    Image.fromarray(
-                        image.astype(np.uint8)
-                    ).resize(
-                        (256, 256),
-                        Image.BICUBIC,
-                    ),
-                    dtype=np.float32,
-                )
-
-        image /= 255.0
-
-        patches = (
-            image.reshape(
-                16, 16,
-                16, 16,
-                3,
-            )
-            .transpose(
-                0, 2, 1, 3, 4
-            )
-            .reshape(
-                256,
-                768,
-            )
-        )
-
-        yabs = np.repeat(
-            np.arange(16),
-            16,
-        )
-
-        xabs = np.tile(
-            np.arange(16),
-            16,
-        )
-
-        ptype = np.ones(
-            256,
-            dtype=np.int32,
-        )
-
-        return (
-            patches.astype(np.float32),
-            ptype,
-            yabs.astype(np.int32),
-            xabs.astype(np.int32),
-        )
-
     def images_to_naflex(self, images):
-        patches = []
-        ptypes = []
-        yabs = []
-        xabs = []
-
-        for image in images:
-            p, pt, y, x = self.image_to_naflex(image)
-
-            patches.append(p)
-            ptypes.append(pt)
-            yabs.append(y)
-            xabs.append(x)
-
+        if not isinstance(images, list) and not isinstance(images, tuple) and not (hasattr(images, "ndim") and images.ndim == 4):
+            images = [images]
+            
+        out = self.processor(images=images, return_tensors="pt", padding=True)
+        pixel_values = out["pixel_values"].numpy()
+        ptypes = out["pixel_attention_mask"].numpy().astype(np.int32)
+        spatial_shapes = out["spatial_shapes"].numpy()
+        
+        batch_size, max_patches, _ = pixel_values.shape
+        yabs = np.zeros((batch_size, max_patches), dtype=np.int32)
+        xabs = np.zeros((batch_size, max_patches), dtype=np.int32)
+        
+        for i in range(batch_size):
+            h, w = spatial_shapes[i]
+            yabs[i, :h*w] = np.repeat(np.arange(h), w)
+            xabs[i, :h*w] = np.tile(np.arange(w), h)
+            
         return (
-            jnp.asarray(patches),
+            jnp.asarray(pixel_values),
             jnp.asarray(ptypes),
             jnp.asarray(yabs),
             jnp.asarray(xabs),
