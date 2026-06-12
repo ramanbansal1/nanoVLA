@@ -156,7 +156,7 @@ class VideoDataset(Dataset):
                 truncation=True,
                 max_length=64,
                 return_tensors="np",
-            )["input_ids"][0],
+            )["input_ids"][0].astype(np.int32),
 
             "observation_state":
                 torch.tensor(
