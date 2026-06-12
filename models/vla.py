@@ -16,7 +16,6 @@ import jax.numpy as jnp
 import torch
 import torch.utils.dlpack
 import numpy as np
-from transformers import AutoProcessor, AutoModelForVision2Seq
 from flax import nnx
 from models.action_state_proj import ActionProjector, ActionUnembed, ObsProjector
 from models.modulator import Modulator
