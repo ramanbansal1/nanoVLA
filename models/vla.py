@@ -23,12 +23,13 @@ from models.DiT import DiT, DiTConfig
 from models.visual_encoder import SigLIP
 
 class VLA(nnx.Module):
-    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, vlm_dim: int = 576, dit_num_blocks: int = 4, vla_k: int = 4, patch_size: int = 5, action_dim: int = 43, horizon: int = 120, vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz"):
+    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, vlm_dim: int = 576, dit_num_blocks: int = 4, vla_k: int = 4, patch_size: int = 5, action_dim: int = 43, horizon: int = 120, vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz", action_compression: int = 5):
         self.hidden_size = hidden_size
         self.vla_k = vla_k
         self.patch_size = patch_size
         self.action_dim = action_dim
         self.horizon = horizon
+        self.action_compression = action_compression
         
         self.vlm = SigLIP(checkpoint_path=vlm_checkpoint_path, normalize=True)
 
@@ -36,8 +37,9 @@ class VLA(nnx.Module):
         self.num_splits = 6
         self.modulator = Modulator(in_dim=768, out_dim=vlm_dim, num_splits=self.num_splits, rngs=rngs)
         
-        self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, rngs=rngs)
-        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, patch_size=patch_size, rngs=rngs)
+        self.action_norm = nnx.InstanceNorm(action_dim, rngs=rngs)
+        self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, compression=self.action_compression, rngs=rngs)
+        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, patch_size=patch_size, compression=self.action_compression, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
         
         dit_config = DiTConfig(
@@ -97,7 +99,8 @@ class VLA(nnx.Module):
         if action is not None:
             B = obs_emb.shape[0]
             
-            action_proj = self.action_projector(action)
+            action_norm = self.action_norm(action)
+            action_proj = self.action_projector(action_norm)
                 
             _, N, _ = action_proj.shape
             
@@ -119,7 +122,7 @@ class VLA(nnx.Module):
                 rngs=rngs
             )
             
-            pred_v_raw = self.action_unembed(dit_out)
+            pred_v_raw = self.action_unembed(dit_out, N=self.horizon // self.patch_size)
             return pred_v_raw
             
         # Inference / Generation Mode (Continuous Flow Matching Euler steps)
@@ -143,7 +146,8 @@ class VLA(nnx.Module):
             for k in range(self.vla_k):
                 t_val = jnp.full((B,), k / self.vla_k)
                 
-                action_proj = self.action_projector(x_t)
+                x_t_norm = self.action_norm(x_t)
+                action_proj = self.action_projector(x_t_norm)
                 
                 v_pred_proj = self.dit.cfg(
                     x=action_proj, 
@@ -156,7 +160,7 @@ class VLA(nnx.Module):
                     mask=None
                 )
                 
-                v_pred_raw = self.action_unembed(v_pred_proj)
+                v_pred_raw = self.action_unembed(v_pred_proj, N=self.horizon // self.patch_size)
                 
                 x_t = x_t + v_pred_raw * dt
                 

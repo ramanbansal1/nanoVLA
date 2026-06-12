@@ -62,7 +62,8 @@ def prepare_datasets(datasets_root_dir):
 
     for repo in dataset_repos:
         ds = load_dataset(repo)['train']
-        if ds.features["timestamp"].dtype == "float32":
+        if "timestamp" in ds.features and ds.features["timestamp"].dtype == "float32":
+            from datasets import Value
             ds = ds.cast_column("timestamp", Value("float64"))
         ds = ds.add_column("dataset_name", [repo.split("/")[-1]] * len(ds))
         
@@ -196,10 +197,11 @@ def main():
     wandb.config.update({"num_trainable_params": num_params})
 
     num_train_steps = config.num_epochs * len(train_loader)
+    warmup_steps = int(0.03 * num_train_steps)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.learning_rate,
-        warmup_steps=500,
+        warmup_steps=warmup_steps,
         decay_steps=num_train_steps,
     )
     
@@ -209,13 +211,10 @@ def main():
     )
     optimizer = nnx.Optimizer(vla, tx, wrt=nnx.Param)
 
-    ema_decay = 0.999
-    ema_state = nnx.state(vla, nnx.Param)
-
     options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True, enable_async_checkpointing=False)
     checkpoint_manager = ocp.CheckpointManager(
         os.path.abspath(config.checkpoint_dir),
-        item_names=("model_state", "optimizer_state", "ema_state"),
+        item_names=("model_state", "optimizer_state"),
         options=options
     )
 
@@ -258,12 +257,6 @@ def main():
                 
                 loss_val, aux, grad_norm = train_step(vla, optimizer, vlm_out, observation_jnp, action_jnp, t, noise_key)
                 
-                # Update EMA state
-                ema_state = jax.tree_util.tree_map(
-                    lambda ema, param: ema_decay * ema + (1 - ema_decay) * param,
-                    ema_state, nnx.state(vla, nnx.Param)
-                )
-                
                 t4 = time.time()
                 pred_v_raw, target_v_raw, x_t = aux
                 
@@ -273,14 +266,14 @@ def main():
                 if step < 5 or step % 50 == 0:
                     console.print(f"[bold cyan]Step {step}[/bold cyan] [dim]Profiling | Prep: {t1-t0:.4f}s | VLM: {t2-t1:.4f}s | DevicePut: {t3-t2:.4f}s | JIT Execute: {t5-t3:.4f}s[/dim]")
                 
-                mean_pred_v = jnp.mean(pred_v_raw)
-                mean_target_v = jnp.mean(target_v_raw)
+                mean_bias = jnp.mean(pred_v_raw - target_v_raw)
+                std_ratio = jnp.std(pred_v_raw) / (jnp.std(target_v_raw) + 1e-8)
     
                 log_dict = {
                     "train/loss": float(loss_val),
                     "train/grad_norm": float(grad_norm),
-                    "train/mean_pred_v": float(mean_pred_v),
-                    "train/mean_target_v": float(mean_target_v),
+                    "train/mean_bias": float(mean_bias),
+                    "train/std_ratio": float(std_ratio),
                     "epoch": epoch + 1
                 }
                 
@@ -297,8 +290,7 @@ def main():
                         global_step, 
                         args=ocp.args.Composite(
                             model_state=ocp.args.StandardSave(model_state),
-                            optimizer_state=ocp.args.StandardSave(opt_state),
-                            ema_state=ocp.args.StandardSave(ema_state)
+                            optimizer_state=ocp.args.StandardSave(opt_state)
                         )
                     )
                     checkpoint_manager.wait_until_finished()
@@ -307,10 +299,6 @@ def main():
                 if global_step % 100 == 0 and global_step > 0 and val_loader is not None:
                     console.print(f"\n[bold yellow]Step {global_step}: Starting Validation...[/bold yellow]")
                     val_losses = []
-                    
-                    # Swap to EMA weights for validation
-                    current_state = nnx.state(vla, nnx.Param)
-                    nnx.update(vla, ema_state)
                     
                     MAX_VAL_BATCHES = 50
                     for val_idx, val_batch in enumerate(val_loader):
@@ -344,9 +332,6 @@ def main():
                         val_loss_val, _ = eval_step(vla, val_vlm_out, val_observation_jnp, val_action_jnp, val_t, val_noise_key)
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_losses.append(float(val_loss_val))
-                    
-                    # Restore live model weights
-                    nnx.update(vla, current_state)
                     
                     if val_losses:
                         mean_val_loss = float(np.mean(val_losses))
