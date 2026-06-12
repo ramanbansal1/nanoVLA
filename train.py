@@ -41,10 +41,10 @@ def custom_collate_fn(batch):
             imgs = []
             for item in batch:
                 first_cam = sorted(item["images"].keys())[0]
-                imgs.append(np.asarray(item["images"][first_cam]))
+                imgs.append(np.array(item["images"][first_cam], copy=True))
             collated["image"] = default_collate(imgs)
         elif key == "input_ids":
-            collated[key] = default_collate([item[key] for item in batch])
+            collated[key] = default_collate([np.array(item[key], copy=True) for item in batch])
         elif key != "images":
             collated[key] = default_collate([item[key] for item in batch])
 
