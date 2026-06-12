@@ -266,15 +266,20 @@ def main():
                 if step < 5 or step % 50 == 0:
                     console.print(f"[bold cyan]Step {step}[/bold cyan] [dim]Profiling | Prep: {t1-t0:.4f}s | VLM: {t2-t1:.4f}s | DevicePut: {t3-t2:.4f}s | JIT Execute: {t5-t3:.4f}s[/dim]")
                 
-                mean_bias = jnp.mean(pred_v_raw - target_v_raw)
+                # Shape: (action_dim,) — tells you WHICH joints are mispredicted
+                per_dim_bias = jnp.mean(pred_v_raw - target_v_raw, axis=(0, 1))  # (A,)
+                per_dim_mae  = jnp.mean(jnp.abs(pred_v_raw - target_v_raw), axis=(0, 1))
+
+                
                 std_ratio = jnp.std(pred_v_raw) / (jnp.std(target_v_raw) + 1e-8)
-    
                 log_dict = {
                     "train/loss": float(loss_val),
                     "train/grad_norm": float(grad_norm),
-                    "train/mean_bias": float(mean_bias),
+                    "train/max_dim_bias": float(jnp.max(jnp.abs(per_dim_bias))),
                     "train/std_ratio": float(std_ratio),
-                    "epoch": epoch + 1
+                    "train/max_dim_mae": float(jnp.max(per_dim_mae)),
+                    "epoch": epoch + 1,
+                    "train/lr": float(schedule(global_step))
                 }
                 
                 wandb.log(log_dict, step=global_step)
