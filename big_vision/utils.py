@@ -41,7 +41,35 @@ import jax.numpy as jnp
 import ml_collections as mlc
 import numpy as np
 
-import tensorflow.io.gfile as gfile  # pylint: disable=consider-using-from-import
+import shutil
+
+class _GFileMock:
+    @staticmethod
+    def GFile(name, mode="r"):
+        return open(name, mode)
+    @staticmethod
+    def exists(name):
+        return os.path.exists(name)
+    @staticmethod
+    def makedirs(name):
+        os.makedirs(name, exist_ok=True)
+    @staticmethod
+    def rmtree(name):
+        if os.path.exists(name):
+            shutil.rmtree(name)
+    @staticmethod
+    def rename(src, dst, overwrite=False):
+        if overwrite and os.path.exists(dst):
+            os.remove(dst)
+        os.rename(src, dst)
+    @staticmethod
+    def listdir(name):
+        return os.listdir(name)
+    @staticmethod
+    def remove(name):
+        os.remove(name)
+
+gfile = _GFileMock()
 
 
 Registry = pp_registry.Registry
