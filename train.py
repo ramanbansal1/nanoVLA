@@ -93,7 +93,7 @@ def prepare_datasets(datasets_root_dir):
 
     return train_ds, val_ds, test_ds
 
-
+def setup_dataloader(config):
     train_ds, val_ds, test_ds = prepare_datasets(config.datasets_root)
     
     def make_loader(ds, is_train):
