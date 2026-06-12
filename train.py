@@ -1,14 +1,9 @@
 #!.venv/bin/python
 import os
-import multiprocessing
 import time
 from rich.console import Console
 console = Console()
 
-try:
-    multiprocessing.set_start_method('spawn', force=True)
-except RuntimeError:
-    pass
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import torch
@@ -16,7 +11,7 @@ import torch.utils.dlpack
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
-from datasets import load_dataset, concatenate_datasets, Value
+from datasets import load_dataset, concatenate_datasets
 from pathlib import Path
 import wandb
 import jax
@@ -26,7 +21,6 @@ from flax import nnx
 import optax
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 
 from config import parse_args, asdict
 from data.advanced_dataset import VideoDataset
@@ -52,6 +46,10 @@ def custom_collate_fn(batch):
 
 
 def torch_to_jax(t):
+    if t.dtype == torch.int64:
+        t = t.to(torch.int32)
+    elif t.dtype == torch.float64:
+        t = t.to(torch.float32)
     return jax.dlpack.from_dlpack(t.contiguous())
 
 
