@@ -2,24 +2,25 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+import math
+
 class Modulator(nnx.Module):
-    def __init__(self, in_dim: int, out_dim: int, num_splits: int, rngs: nnx.Rngs):
+    def __init__(self, in_dim: int, out_dim: int, rngs: nnx.Rngs):
         """
         Args:
-            in_dim: The input dimension size (e.g., 512 from VLM).
-            out_dim: The projected dimension size (e.g., 576).
-            num_splits: The number of tokens to split each projected token into.
-            rngs: NNX Rngs object for initialization.
+            in_dim: The input dimension size (e.g., 768 from VLM).
+            out_dim: The final target feature dimension per split token (e.g., hidden_size).
         """
-        if out_dim % num_splits != 0:
-            raise ValueError(f"Projected dimension must be divisible by {num_splits}, got {out_dim}")
-            
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.num_splits = num_splits
+        
+        # Automatically determine the number of splits needed to comfortably project in_dim
+        # such that each split has the target out_dim
+        self.num_splits = math.ceil(in_dim / out_dim)
+        self.proj_dim = self.num_splits * out_dim
         
         # Linear layer to project the input to the target dimension
-        self.proj = nnx.Linear(in_dim, out_dim, rngs=rngs)
+        self.proj = nnx.Linear(in_dim, self.proj_dim, rngs=rngs)
         
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """
@@ -27,18 +28,17 @@ class Modulator(nnx.Module):
             x: input array of shape [B, S, in_dim]
             
         Returns:
-            Projected, GELU-activated, and split array of shape [B, S * num_splits, out_dim // num_splits]
+            Projected, GELU-activated, and split array of shape [B, S * num_splits, out_dim]
         """
-        # 1. Project: [B, S, in_dim] -> [B, S, out_dim]
+        # 1. Project: [B, S, in_dim] -> [B, S, proj_dim]
         x = self.proj(x)
         
         # 2. GELU activation
         x = nnx.gelu(x)
         
-        # 3. Split into tokens: [B, S, out_dim] -> [B, S * num_splits, out_dim // num_splits]
+        # 3. Split into tokens: [B, S, proj_dim] -> [B, S * num_splits, out_dim]
         B, S, _ = x.shape
-        split_dim = self.out_dim // self.num_splits
-        x = x.reshape(B, S * self.num_splits, split_dim)
+        x = x.reshape(B, S * self.num_splits, self.out_dim)
         
         return x
 

@@ -23,7 +23,7 @@ from models.DiT import DiT, DiTConfig
 from models.visual_encoder import SigLIP
 
 class VLA(nnx.Module):
-    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, vlm_dim: int = 576, dit_num_blocks: int = 4, vla_k: int = 4, patch_size: int = 5, action_dim: int = 43, horizon: int = 120, vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz", action_compression: int = 5):
+    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, dit_num_blocks: int = 4, vla_k: int = 4, patch_size: int = 5, action_dim: int = 43, horizon: int = 120, vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz", action_compression: int = 5):
         self.hidden_size = hidden_size
         self.vla_k = vla_k
         self.patch_size = patch_size
@@ -33,9 +33,7 @@ class VLA(nnx.Module):
         
         self.vlm = SigLIP(checkpoint_path=vlm_checkpoint_path, normalize=True)
 
-        
-        self.num_splits = 6
-        self.modulator = Modulator(in_dim=768, out_dim=vlm_dim, num_splits=self.num_splits, rngs=rngs)
+        self.modulator = Modulator(in_dim=768, out_dim=hidden_size, rngs=rngs)
         
         self.action_norm = nnx.InstanceNorm(action_dim, rngs=rngs)
         self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, compression=self.action_compression, rngs=rngs)
