@@ -304,6 +304,9 @@ def main():
                 if global_step % 100 == 0 and global_step > 0 and val_loader is not None:
                     console.print(f"\n[bold yellow]Step {global_step}: Starting Validation...[/bold yellow]")
                     val_losses = []
+                    val_std_ratios = []
+                    val_max_dim_biases = []
+                    val_max_dim_maes = []
                     
                     MAX_VAL_BATCHES = 50
                     for val_idx, val_batch in enumerate(val_loader):
@@ -334,14 +337,32 @@ def main():
                         if global_step == 100 and val_idx == 0:
                             console.print("[bold cyan]Note: JAX is compiling the validation step for the first time. This may take 3-5 minutes...[/bold cyan]")
                             
-                        val_loss_val, _ = eval_step(vla, val_vlm_out, val_observation_jnp, val_action_jnp, val_t, val_noise_key)
+                        val_loss_val, val_aux = eval_step(vla, val_vlm_out, val_observation_jnp, val_action_jnp, val_t, val_noise_key)
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_losses.append(float(val_loss_val))
+                        
+                        val_pred_v_raw, val_target_v_raw, _ = val_aux
+                        val_per_dim_bias = jnp.mean(val_pred_v_raw - val_target_v_raw, axis=(0, 1))
+                        val_per_dim_mae = jnp.mean(jnp.abs(val_pred_v_raw - val_target_v_raw), axis=(0, 1))
+                        val_std_ratio = jnp.std(val_pred_v_raw) / (jnp.std(val_target_v_raw) + 1e-8)
+                        
+                        val_std_ratios.append(float(val_std_ratio))
+                        val_max_dim_biases.append(float(jnp.max(jnp.abs(val_per_dim_bias))))
+                        val_max_dim_maes.append(float(jnp.max(val_per_dim_mae)))
                     
                     if val_losses:
                         mean_val_loss = float(np.mean(val_losses))
+                        mean_val_std_ratio = float(np.mean(val_std_ratios))
+                        mean_val_max_dim_bias = float(np.mean(val_max_dim_biases))
+                        mean_val_max_dim_mae = float(np.mean(val_max_dim_maes))
+                        
                         console.print(f"[bold magenta]Step {global_step} - Validation Loss (MSE): {mean_val_loss:.4f}[/bold magenta]\n")
-                        wandb.log({"val/loss": mean_val_loss}, step=global_step)
+                        wandb.log({
+                            "val/loss": mean_val_loss,
+                            "val/std_ratio": mean_val_std_ratio,
+                            "val/max_dim_bias": mean_val_max_dim_bias,
+                            "val/max_dim_mae": mean_val_max_dim_mae
+                        }, step=global_step)
                     
                 global_step += 1
 
