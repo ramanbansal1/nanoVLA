@@ -114,9 +114,7 @@ class MultiGPUEncoder:
         _IMG_PARAMS = vlm.img_params
         _TXT_PARAMS = vlm.txt_params
 
-        # Replicate params across devices once
-        self.img_params_rep = jax.device_put_replicated(vlm.img_params, jax.devices())
-        self.txt_params_rep = jax.device_put_replicated(vlm.txt_params, jax.devices())
+        # Replicate params across devices once (handled implicitly by jax.pmap capturing globals)
 
         # Compile pmap kernels
         self._pmap_img = jax.pmap(_pmap_encode_image, axis_name="batch")
