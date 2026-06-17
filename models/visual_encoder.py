@@ -17,16 +17,6 @@ from big_vision.models.proj.image_text.text_transformer import (
 class SigLIP:
     """
     SigLIP2 Base (Big Vision checkpoint)
-
-    Image embedding:
-        PIL.Image -> (768,)
-
-    Text embedding:
-        str -> (768,)
-
-    Similarity:
-        cosine similarity via dot product
-        (embeddings are normalized)
     """
 
     def __init__(
@@ -39,7 +29,6 @@ class SigLIP:
         self.max_text_length = max_text_length
 
         ckpt = utils.load_params(checkpoint_path)
-
         self.img_params = ckpt["img"]
         self.txt_params = ckpt["txt"]
 
@@ -51,10 +40,7 @@ class SigLIP:
             "google/siglip2-base-patch16-naflex"
         )
 
-        # ==================================================
-        # IMAGE MODEL
-        # ==================================================
-
+        # ================= IMAGE MODEL =================
         self.image_model = ImageModel(
             width=768,
             depth=12,
@@ -72,16 +58,9 @@ class SigLIP:
             jnp.zeros((1, 256), dtype=jnp.int32),
         )
 
-        self.image_model.init(
-            jax.random.PRNGKey(0),
-            image_dummy,
-            train=False,
-        )
+        self.image_model.init(jax.random.PRNGKey(0), image_dummy, train=False)
 
-        # ==================================================
-        # TEXT MODEL
-        # ==================================================
-
+        # ================= TEXT MODEL =================
         self.text_model = TextModel(
             num_classes=768,
             width=768,
@@ -93,105 +72,70 @@ class SigLIP:
             scan=True,
         )
 
-        text_dummy = jnp.zeros(
-            (1, max_text_length),
-            dtype=jnp.int32,
-        )
+        text_dummy = jnp.zeros((1, max_text_length), dtype=jnp.int32)
+        self.text_model.init(jax.random.PRNGKey(0), text_dummy, train=False)
 
-        self.text_model.init(
-            jax.random.PRNGKey(0),
-            text_dummy,
-            train=False,
-        )
+        # ================= JIT =================
+        self._encode_image_jit = jax.jit(self._encode_image_impl)
+        self._encode_text_jit = jax.jit(self._encode_text_impl)
 
-        # ==================================================
-        # JIT COMPILE
-        # ==================================================
-
-        self._encode_image_jit = jax.jit(
-            self._encode_image_impl
-        )
-
-        self._encode_text_jit = jax.jit(
-            self._encode_text_impl
-        )
-
-        self._encode_image_jit(
-            *image_dummy
-        ).block_until_ready()
-
-        self._encode_text_jit(
-            text_dummy
-        ).block_until_ready()
+        img_out = self._encode_image_jit(*image_dummy)
+        img_out.block_until_ready()   # hidden
+        
+        txt_out = self._encode_text_jit(text_dummy)
+        txt_out.block_until_ready()   # hidden
 
     # ======================================================
-    # INTERNAL IMAGE ENCODER
+    # IMAGE ENCODER (emb + hidden)
     # ======================================================
-
-    def _encode_image_impl(
-        self,
-        patches,
-        ptype,
-        yabs,
-        xabs,
-    ):
-        emb, _ = self.image_model.apply(
+    def _encode_image_impl(self, patches, ptype, yabs, xabs):
+        emb, out = self.image_model.apply(
             {"params": self.img_params},
             (patches, ptype, yabs, xabs),
             train=False,
         )
 
-        if self.normalize:
-            emb = emb / jnp.linalg.norm(
-                emb,
-                axis=-1,
-                keepdims=True,
-            )
+        hidden = out["encoded"]   # (B, Npatches, 768)
 
-        return emb
+        return hidden
 
     # ======================================================
-    # INTERNAL TEXT ENCODER
+    # TEXT ENCODER (emb + hidden)
     # ======================================================
-
     def _encode_text_impl(self, input_ids):
-        emb, _ = self.text_model.apply(
+        emb, out = self.text_model.apply(
             {"params": self.txt_params},
             input_ids,
             train=False,
         )
 
-        if self.normalize:
-            emb = emb / jnp.linalg.norm(
-                emb,
-                axis=-1,
-                keepdims=True,
-            )
+        hidden = out['transformed']
 
-        return emb
+        return hidden
 
     # ======================================================
     # IMAGE PREPROCESSING
     # ======================================================
-
     def images_to_naflex(self, images):
-        if not isinstance(images, list) and not isinstance(images, tuple) and not (hasattr(images, "ndim") and images.ndim == 4):
+        if not isinstance(images, list) and not isinstance(images, tuple) and not (
+            hasattr(images, "ndim") and images.ndim == 4
+        ):
             images = [images]
-            
+
         out = self.processor(images=images, return_tensors="pt", padding=True)
         pixel_values = out["pixel_values"].numpy()
         ptypes = out["pixel_attention_mask"].numpy().astype(np.int32)
         spatial_shapes = out["spatial_shapes"].numpy()
-        
+
         batch_size, max_patches, _ = pixel_values.shape
         yabs = np.zeros((batch_size, max_patches), dtype=np.int32)
         xabs = np.zeros((batch_size, max_patches), dtype=np.int32)
-        
+
         for i in range(batch_size):
             h, w = spatial_shapes[i]
-            yabs[i, :h*w] = np.repeat(np.arange(h), w)
-            xabs[i, :h*w] = np.tile(np.arange(w), h)
-            
+            yabs[i, :h * w] = np.repeat(np.arange(h), w)
+            xabs[i, :h * w] = np.tile(np.arange(w), h)
+
         return (
             jnp.asarray(pixel_values),
             jnp.asarray(ptypes),
@@ -202,33 +146,25 @@ class SigLIP:
     # ======================================================
     # IMAGE API
     # ======================================================
+    def encode_images(self, images):
+        patches, ptype, yabs, xabs = self.images_to_naflex(images)
+
+        hidden = self._encode_image_jit(
+            patches, ptype, yabs, xabs
+        )
+
+        return np.asarray(hidden)
 
     def encode_image(self, image):
         return self.encode_images([image])[0]
 
-    def encode_images(self, images):
-        patches, ptype, yabs, xabs = (
-            self.images_to_naflex(images)
-        )
-
-        emb = self._encode_image_jit(
-            patches,
-            ptype,
-            yabs,
-            xabs,
-        )
-
-        return np.asarray(emb)
-
     # ======================================================
     # TEXT API
     # ======================================================
-
-    def encode_text(self, text):
-        return self.encode_texts([text])[0]
-
     def encode_texts(self, texts):
-        if isinstance(texts, str) or (isinstance(texts, list) and isinstance(texts[0], str)):
+        if isinstance(texts, str) or (
+            isinstance(texts, list) and isinstance(texts[0], str)
+        ):
             batch = self.tokenizer(
                 texts,
                 padding="max_length",
@@ -238,22 +174,10 @@ class SigLIP:
             )
             input_ids = batch["input_ids"]
         else:
-            # Assume it's already an array of input_ids
             input_ids = texts
 
-        emb = self._encode_text_jit(
-            jnp.asarray(input_ids)
-        )
+        hidden = self._encode_text_jit(jnp.asarray(input_ids))
+        return np.asarray(hidden)
 
-        return np.asarray(emb)
-
-    # ======================================================
-    # SIMILARITY
-    # ======================================================
-
-    @staticmethod
-    def similarity(
-        image_embeddings,
-        text_embeddings,
-    ):
-        return image_embeddings @ text_embeddings.T
+    def encode_text(self, text):
+        return self.encode_texts([text])[0]

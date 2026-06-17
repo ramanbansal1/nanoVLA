@@ -39,6 +39,8 @@ def custom_collate_fn(batch):
             collated["image"] = default_collate(imgs)
         elif key == "input_ids":
             collated[key] = default_collate([np.array(item[key], copy=True) for item in batch])
+        elif key == "vlm_out":
+            collated[key] = default_collate([np.array(item[key], copy=True) for item in batch])
         elif key != "images":
             collated[key] = default_collate([item[key] for item in batch])
 
@@ -102,6 +104,7 @@ def setup_dataloader(config):
             dataset=ds,
             datasets_root=config.datasets_root,
             action_horizon=config.action_horizon,
+            precompute_path=config.precompute_path,
         )
         return DataLoader(
             dataset, 
@@ -231,11 +234,7 @@ def main():
             for step, batch in enumerate(train_loader):
                 t0 = time.time()
             
-                images_np = batch['image'].numpy()
-                
-                input_ids = batch['input_ids']  # This is a PyTorch tensor now because of default_collate
-                input_ids_np = input_ids.numpy()
-                
+                vlm_out_jnp = torch_to_jax(batch['vlm_out'])
                 observation_jnp = torch_to_jax(batch['observation_state'])
                 action_jnp = torch_to_jax(batch['action'])
                 
@@ -244,18 +243,15 @@ def main():
                 t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
                 
                 t1 = time.time()
-                img_embs = jnp.asarray(vla.vlm.encode_images(images_np))
-                txt_embs = jnp.asarray(vla.vlm.encode_texts(input_ids_np))
-                vlm_out = jnp.concatenate([txt_embs[:, None, :], img_embs[:, None, :]], axis=1)
                 t2 = time.time()
                 
-                vlm_out = jax.device_put(vlm_out, batch_sharding)
+                vlm_out_jnp = jax.device_put(vlm_out_jnp, batch_sharding)
                 observation_jnp = jax.device_put(observation_jnp, batch_sharding)
                 action_jnp = jax.device_put(action_jnp, batch_sharding)
                 t = jax.device_put(t, batch_sharding)
                 t3 = time.time()
                 
-                loss_val, aux, grad_norm = train_step(vla, optimizer, vlm_out, observation_jnp, action_jnp, t, noise_key)
+                loss_val, aux, grad_norm = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key)
                 
                 t4 = time.time()
                 pred_v_raw, target_v_raw, x_t = aux
@@ -313,11 +309,7 @@ def main():
                         if val_idx >= MAX_VAL_BATCHES:
                             break
                             
-                        val_images_np = val_batch['image'].numpy()
-                            
-                        val_input_ids = val_batch['input_ids']
-                        val_input_ids_np = val_input_ids.numpy()
-                        
+                        val_vlm_out_jnp = torch_to_jax(val_batch['vlm_out'])
                         val_observation_jnp = torch_to_jax(val_batch['observation_state'])
                         val_action_jnp = torch_to_jax(val_batch['action'])
                         
@@ -325,11 +317,7 @@ def main():
                         val_key, val_noise_key, val_t_key = jax.random.split(val_key, 3)
                         val_t = jax.random.uniform(val_t_key, shape=(val_action_jnp.shape[0],))
                         
-                        val_img_embs = jnp.asarray(vla.vlm.encode_images(val_images_np))
-                        val_txt_embs = jnp.asarray(vla.vlm.encode_texts(val_input_ids_np))
-                        val_vlm_out = jnp.concatenate([val_txt_embs[:, None, :], val_img_embs[:, None, :]], axis=1)
-                        
-                        val_vlm_out = jax.device_put(val_vlm_out, batch_sharding)
+                        val_vlm_out_jnp = jax.device_put(val_vlm_out_jnp, batch_sharding)
                         val_observation_jnp = jax.device_put(val_observation_jnp, batch_sharding)
                         val_action_jnp = jax.device_put(val_action_jnp, batch_sharding)
                         val_t = jax.device_put(val_t, batch_sharding)
@@ -337,7 +325,7 @@ def main():
                         if global_step == 100 and val_idx == 0:
                             console.print("[bold cyan]Note: JAX is compiling the validation step for the first time. This may take 3-5 minutes...[/bold cyan]")
                             
-                        val_loss_val, val_aux = eval_step(vla, val_vlm_out, val_observation_jnp, val_action_jnp, val_t, val_noise_key)
+                        val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key)
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_losses.append(float(val_loss_val))
                         

@@ -18,6 +18,7 @@ class TrainConfig:
     dit_num_blocks: int = 4
     vla_k: int = 4
     vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz"
+    precompute_path: str = "data/precomputed_vlm"
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="nanoVLA Training Configuration")
@@ -57,6 +58,8 @@ def parse_args() -> TrainConfig:
                         help=f"Number of flow matching iterations K (default: {default_config.vla_k})")
     parser.add_argument("--vlm_checkpoint_path", type=str, default=default_config.vlm_checkpoint_path,
                         help=f"Path to VLM checkpoint (default: {default_config.vlm_checkpoint_path})")
+    parser.add_argument("--precompute_path", type=str, default=default_config.precompute_path,
+                        help=f"Path to save precomputed VLM embeddings (default: {default_config.precompute_path})")
     
     args = parser.parse_args()
     
@@ -75,5 +78,6 @@ def parse_args() -> TrainConfig:
         checkpoint_dir=args.checkpoint_dir,
         dit_num_blocks=args.dit_num_blocks,
         vla_k=args.vla_k,
-        vlm_checkpoint_path=args.vlm_checkpoint_path
+        vlm_checkpoint_path=args.vlm_checkpoint_path,
+        precompute_path=args.precompute_path
     )

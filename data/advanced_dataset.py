@@ -45,10 +45,16 @@ class VideoDataset(Dataset):
         dataset,
         datasets_root,
         action_horizon,
+        precompute_path=None,
     ):
         self.dataset = dataset
         self.datasets_root = Path(datasets_root)
         self.action_horizon = action_horizon
+        self.precompute_path = Path(precompute_path) if precompute_path else None
+        
+        # Cache for loaded .npz files
+        self._vlm_cache = {}
+        self._max_cache_size = 10
 
         self.state_dim = len(
             dataset[0]["observation.state"]
@@ -149,15 +155,6 @@ class VideoDataset(Dataset):
         instruction = build_instruction(row["subtask_annotation"])
         
         data = {
-            "instruction": instruction,
-            "input_ids": self.tokenizer(
-                instruction,
-                padding="max_length",
-                truncation=True,
-                max_length=64,
-                return_tensors="np",
-            )["input_ids"][0].astype(np.int32),
-
             "observation_state":
                 torch.tensor(
                     row["observation.state"],
@@ -180,7 +177,33 @@ class VideoDataset(Dataset):
                 row["frame_index"],
         }
         
-        data["images"] = self._load_images(row)
+        if self.precompute_path is not None:
+            repo_name = row["dataset_name"]
+            cache_key = f"{repo_name}_{ep_id}"
+            
+            if cache_key not in self._vlm_cache:
+                npz_path = self.precompute_path / repo_name / f"ep_{ep_id}.npz"
+                if npz_path.exists():
+                    self._vlm_cache[cache_key] = np.load(npz_path)["vlm_out"]
+                    if len(self._vlm_cache) > self._max_cache_size:
+                        self._vlm_cache.pop(next(iter(self._vlm_cache)))
+                else:
+                    raise FileNotFoundError(f"Missing precomputed VLM features: {npz_path}")
+            
+            relative_idx = idx - ep_start
+            data["vlm_out"] = torch.tensor(self._vlm_cache[cache_key][relative_idx], dtype=torch.float32)
+        else:
+            data["images"] = self._load_images(row)
+            
+            instruction = build_instruction(row["subtask_annotation"])
+            data["instruction"] = instruction
+            data["input_ids"] = self.tokenizer(
+                instruction,
+                padding="max_length",
+                truncation=True,
+                max_length=64,
+                return_tensors="np",
+            )["input_ids"][0].astype(np.int32)
             
         return data
         """

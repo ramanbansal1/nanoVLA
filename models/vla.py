@@ -86,9 +86,9 @@ class VLA(nnx.Module):
             pred_v_raw for training, or x_t for inference.
         """
         if vlm_out is None:
-            img_embs = jnp.asarray(self.vlm.encode_images(images))
-            txt_embs = jnp.asarray(self.vlm.encode_texts(input_ids))
-            vlm_out = jnp.concatenate([txt_embs[:, None, :], img_embs[:, None, :]], axis=1)
+            img_hidden = jnp.asarray(self.vlm.encode_images(images))
+            txt_hidden = jnp.asarray(self.vlm.encode_texts(input_ids))
+            vlm_out = jnp.concatenate([txt_hidden, img_hidden], axis=1)
         
         vlm_modulated = self.modulator(vlm_out)
         obs_emb = self.obs_projector(observation)
