@@ -23,28 +23,42 @@ def main():
     # Initialize the SigLIP model; its __init__ automatically compiles the JIT functions.
     vlm = SigLIP(checkpoint_path=config.vlm_checkpoint_path, normalize=True)
     
-    print("Loading HuggingFace Dataset...")
-    hf_dataset = load_dataset(
-        "jake-ha/RoboCOIN", 
-        data_dir=config.datasets_root, 
-        split="train"
-    )
+    print("Loading datasets from datasets_root...")
+    datasets_root_dir = Path(config.datasets_root)
+    dataset_repos = sorted([p for p in datasets_root_dir.iterdir() if p.is_dir()])
     
+    if not dataset_repos:
+        print(f"No datasets found in {config.datasets_root}")
+        return
+        
+    from datasets import concatenate_datasets
+    all_datasets = []
+    
+    for repo_path in dataset_repos:
+        repo_name = repo_path.name
+        print(f"Loading dataset: {repo_name}")
+        ds = load_dataset(str(repo_path))['train']
+        ds = ds.add_column("dataset_name", [repo_name] * len(ds))
+        all_datasets.append(ds)
+        
+    combined_hf_dataset = concatenate_datasets(all_datasets)
+    print(f"\\nCombined dataset size: {len(combined_hf_dataset)} rows")
+        
     video_dataset = VideoDataset(
-        dataset=hf_dataset,
+        dataset=combined_hf_dataset,
         datasets_root=config.datasets_root,
         action_horizon=config.action_horizon,
         precompute_path=None
     )
     
     episodes = video_dataset.episode_ranges
+    print(f"Precomputing for {len(episodes)} total episodes...")
     
-    print(f"Precomputing for {len(episodes)} episodes...")
+    batch_size = config.batch_size
     
-    batch_size = 16
-    
-    for ep_id, (ep_start, ep_end) in tqdm(episodes.items(), desc="Episodes"):
-        repo_name = hf_dataset[ep_start]["dataset_name"]
+    for ep_id, (ep_start, ep_end) in tqdm(episodes.items(), desc="All Episodes"):
+        repo_name = combined_hf_dataset[ep_start]["dataset_name"]
+        
         save_dir = precompute_path / repo_name
         save_dir.mkdir(parents=True, exist_ok=True)
         
