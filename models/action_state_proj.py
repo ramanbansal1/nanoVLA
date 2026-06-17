@@ -21,95 +21,127 @@ class ObsProjector(nnx.Module):
 
 
 class ActionProjector(nnx.Module):
-    def __init__(self, action_dim: int, patch_size: int, hidden_size: int, compression: int, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        action_dim: int,
+        patch_size: int,
+        hidden_size: int,
+        rngs: nnx.Rngs,
+    ):
         self.patch_size = patch_size
         self.action_dim = action_dim
-        self.hidden_size = hidden_size
-        self.compression = compression
-        self.compressed_dim = action_dim // compression
 
-        self.linear = nnx.Linear(patch_size, hidden_size, rngs=rngs)
-        self.norm = nnx.LayerNorm(num_features=hidden_size, rngs=rngs)
-        self.gelu = nnx.gelu
-        self.conv = nnx.Conv(
-            in_features=hidden_size,
-            out_features=hidden_size,
-            kernel_size=(compression,),
-            strides=(compression,),
-            rngs=rngs
+        patch_dim = patch_size * action_dim
+
+        self.action_norm = nnx.LayerNorm(
+            num_features=action_dim,
+            rngs=rngs,
         )
+
+        self.linear1 = nnx.Linear(
+            patch_dim,
+            hidden_size * 2,
+            rngs=rngs,
+        )
+
+        self.norm = nnx.LayerNorm(
+            num_features=hidden_size * 2,
+            rngs=rngs,
+        )
+
+        self.linear2 = nnx.Linear(
+            hidden_size * 2,
+            hidden_size,
+            rngs=rngs,
+        )
+
+        self.gelu = nnx.gelu
 
     def __call__(self, x):
         B, H, A = x.shape
+        
+        x = self.action_norm(x)
+
         P = self.patch_size
         N = H // P
+
         assert H % P == 0
 
-        # Step 1: (B, H, A) → (B, N, P, A)
-        x = jnp.reshape(x, (B, N, P, A))
+        # (B,H,A) -> (B,N,P,A)
+        x = x.reshape(B, N, P, A)
 
-        # Step 2: → (B, N, A, P)  ← your desired shape
-        x = jnp.transpose(x, (0, 1, 3, 2))
+        # (B,N,P,A) -> (B,N,P*A)
+        x = x.reshape(B, N, P * A)
 
-        # Step 3: Linear over P → (B, N, A, hidden_size)
-        x = self.linear(x)
+        # Patch encoder
+        x = self.linear1(x)
         x = self.norm(x)
         x = self.gelu(x)
+        x = self.linear2(x)
 
-        # Step 4: Conv over A → (B*N, A//c, hidden_size)
-        x = jnp.reshape(x, (B * N, A, self.hidden_size))
-        x = self.conv(x)                                  # (B*N, A//c, D)
-
-        # Step 5: → (B, N * (A//c), hidden_size)
-        out = jnp.reshape(x, (B, N * self.compressed_dim, self.hidden_size))
-        return out
+        # (B,N,D)
+        return x
 
 
 class ActionUnembed(nnx.Module):
-    def __init__(self, action_dim: int, hidden_size: int, patch_size: int, compression: int, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        action_dim: int,
+        patch_size: int,
+        hidden_size: int,
+        rngs: nnx.Rngs,
+    ):
         self.patch_size = patch_size
         self.action_dim = action_dim
-        self.compression = compression
-        self.compressed_dim = action_dim // compression
 
-        # Deconv to expand A//c → A
-        self.deconv = nnx.ConvTranspose(
-            in_features=hidden_size,
-            out_features=hidden_size,
-            kernel_size=(compression,),
-            strides=(compression,),
-            rngs=rngs
+        patch_dim = patch_size * action_dim
+
+        self.linear1 = nnx.Linear(
+            hidden_size,
+            hidden_size * 4,
+            rngs=rngs,
         )
-        
+
+        self.norm = nnx.LayerNorm(
+            num_features=hidden_size * 4,
+            rngs=rngs,
+        )
+
+        self.linear2 = nnx.Linear(
+            hidden_size * 4,
+            patch_dim,
+            rngs=rngs,
+        )
+
         self.gelu = nnx.gelu
+        self.out_scale = nnx.Param(jnp.ones((action_dim,)))
 
-        # Linear over hidden_size → P
-        self.linear = nnx.Linear(hidden_size, patch_size, rngs=rngs)
+    def __call__(self, x):
+        B, N, D = x.shape
 
-    def __call__(self, x, N: int):
-        # x: (B, N * (A//c), D)
-        B = x.shape[0]
-        A_c = self.compressed_dim
-        D = x.shape[-1]
-
-        # Step 1: → (B*N, A//c, D)
-        x = jnp.reshape(x, (B * N, A_c, D))
-
-        # Step 2: Deconv → (B*N, A, D)
-        x = self.deconv(x)
+        x = self.linear1(x)
+        x = self.norm(x)
         x = self.gelu(x)
+        x = self.linear2(x)
 
-        # Step 3: Linear → (B*N, A, P)
-        x = self.linear(x)                            # (B*N, A, P)
+        # (B,N,P*A)
+        x = x.reshape(
+            B,
+            N,
+            self.patch_size,
+            self.action_dim,
+        )
 
-        # Step 4: → (B, N, A, P)
-        x = jnp.reshape(x, (B, N, self.action_dim, self.patch_size))
+        # (B,H,A)
+        x = x.reshape(
+            B,
+            N * self.patch_size,
+            self.action_dim,
+        )
 
-        # Step 5: → (B, H, A)
-        x = jnp.transpose(x, (0, 1, 3, 2))           # (B, N, P, A)
-        out = jnp.reshape(x, (B, N * self.patch_size, self.action_dim))
+        x = x * self.out_scale
 
-        return out
+        return x
 
 
 if __name__ == "__main__":

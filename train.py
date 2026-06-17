@@ -155,8 +155,16 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key):
     )
     
     # 5. MSE Loss on raw velocity
-    loss_val = jnp.mean((pred_v_raw - target_v) ** 2)
-    return loss_val, (pred_v_raw, target_v, x_t)
+    fm_loss = jnp.mean((pred_v_raw - target_v) ** 2)
+    
+    # 6. Action Reconstruction Huber Loss
+    action_norm = model.action_norm(action)
+    action_proj = model.action_projector(action_norm)
+    action_recon = model.action_unembed(action_proj)
+    recon_loss = jnp.mean(optax.huber_loss(action_recon, action, delta=1.0))
+    
+    loss_val = fm_loss + recon_loss
+    return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss)
 
 
 @nnx.jit
@@ -166,7 +174,16 @@ def train_step(model, optimizer, vlm_out, observation, action, t, noise_key):
     optimizer.update(model, grads)
     
     grad_norm = optax.global_norm(grads)
-    return loss_val, aux, grad_norm
+    
+    comp_grad_norms = {
+        "action_projector": optax.global_norm(grads.action_projector) if hasattr(grads, "action_projector") else 0.0,
+        "action_unembed": optax.global_norm(grads.action_unembed) if hasattr(grads, "action_unembed") else 0.0,
+        "dit": optax.global_norm(grads.dit) if hasattr(grads, "dit") else 0.0,
+        "modulator": optax.global_norm(grads.modulator) if hasattr(grads, "modulator") else 0.0,
+        "obs_projector": optax.global_norm(grads.obs_projector) if hasattr(grads, "obs_projector") else 0.0,
+    }
+    
+    return loss_val, aux, grad_norm, comp_grad_norms
 
 
 @nnx.jit
@@ -251,10 +268,10 @@ def main():
                 t = jax.device_put(t, batch_sharding)
                 t3 = time.time()
                 
-                loss_val, aux, grad_norm = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key)
+                loss_val, aux, grad_norm, comp_grad_norms = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key)
                 
                 t4 = time.time()
-                pred_v_raw, target_v_raw, x_t = aux
+                pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss = aux
                 
                 loss_val = jax.block_until_ready(loss_val)
                 t5 = time.time()
@@ -270,6 +287,8 @@ def main():
                 std_ratio = jnp.std(pred_v_raw) / (jnp.std(target_v_raw) + 1e-8)
                 log_dict = {
                     "train/loss": float(loss_val),
+                    "train/fm_loss": float(fm_loss),
+                    "train/recon_loss": float(recon_loss),
                     "train/grad_norm": float(grad_norm),
                     "train/max_dim_bias": float(jnp.max(jnp.abs(per_dim_bias))),
                     "train/std_ratio": float(std_ratio),
@@ -278,10 +297,13 @@ def main():
                     "train/lr": float(schedule(global_step))
                 }
                 
+                for comp_name, norm_val in comp_grad_norms.items():
+                    log_dict[f"grad/{comp_name}"] = float(norm_val)
+                
                 wandb.log(log_dict, step=global_step)
                 
                 if step % 100 == 0:
-                    console.print(f"[dim]Step {global_step} | Loss: {float(loss_val):.4f} | Grad: {float(grad_norm):.3f}[/dim]")
+                    console.print(f"[dim]Step {global_step} | Loss: {float(loss_val):.4f} (FM: {float(fm_loss):.4f}, Recon: {float(recon_loss):.4f}) | Grad: {float(grad_norm):.3f}[/dim]")
                 
                 if global_step % config.save_every == 0 and global_step > 0:
                     console.print(f"\n[bold yellow]Step {global_step}: Saving Checkpoint...[/bold yellow]")
@@ -300,6 +322,8 @@ def main():
                 if global_step % 100 == 0 and global_step > 0 and val_loader is not None:
                     console.print(f"\n[bold yellow]Step {global_step}: Starting Validation...[/bold yellow]")
                     val_losses = []
+                    val_fm_losses = []
+                    val_recon_losses = []
                     val_std_ratios = []
                     val_max_dim_biases = []
                     val_max_dim_maes = []
@@ -329,7 +353,9 @@ def main():
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_losses.append(float(val_loss_val))
                         
-                        val_pred_v_raw, val_target_v_raw, _ = val_aux
+                        val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss = val_aux
+                        val_fm_losses.append(float(val_fm_loss))
+                        val_recon_losses.append(float(val_recon_loss))
                         val_per_dim_bias = jnp.mean(val_pred_v_raw - val_target_v_raw, axis=(0, 1))
                         val_per_dim_mae = jnp.mean(jnp.abs(val_pred_v_raw - val_target_v_raw), axis=(0, 1))
                         val_std_ratio = jnp.std(val_pred_v_raw) / (jnp.std(val_target_v_raw) + 1e-8)
@@ -340,13 +366,17 @@ def main():
                     
                     if val_losses:
                         mean_val_loss = float(np.mean(val_losses))
+                        mean_val_fm_loss = float(np.mean(val_fm_losses))
+                        mean_val_recon_loss = float(np.mean(val_recon_losses))
                         mean_val_std_ratio = float(np.mean(val_std_ratios))
                         mean_val_max_dim_bias = float(np.mean(val_max_dim_biases))
                         mean_val_max_dim_mae = float(np.mean(val_max_dim_maes))
                         
-                        console.print(f"[bold magenta]Step {global_step} - Validation Loss (MSE): {mean_val_loss:.4f}[/bold magenta]\n")
+                        console.print(f"[bold magenta]Step {global_step} - Validation Loss: {mean_val_loss:.4f} (FM: {mean_val_fm_loss:.4f}, Recon: {mean_val_recon_loss:.4f})[/bold magenta]\n")
                         wandb.log({
                             "val/loss": mean_val_loss,
+                            "val/fm_loss": mean_val_fm_loss,
+                            "val/recon_loss": mean_val_recon_loss,
                             "val/std_ratio": mean_val_std_ratio,
                             "val/max_dim_bias": mean_val_max_dim_bias,
                             "val/max_dim_mae": mean_val_max_dim_mae

@@ -120,7 +120,7 @@ class VLA(nnx.Module):
                 rngs=rngs
             )
             
-            pred_v_raw = self.action_unembed(dit_out, N=self.horizon // self.patch_size)
+            pred_v_raw = self.action_unembed(dit_out)
             return pred_v_raw
             
         # Inference / Generation Mode (Continuous Flow Matching Euler steps)
@@ -158,7 +158,7 @@ class VLA(nnx.Module):
                     mask=None
                 )
                 
-                v_pred_raw = self.action_unembed(v_pred_proj, N=self.horizon // self.patch_size)
+                v_pred_raw = self.action_unembed(v_pred_proj)
                 
                 x_t = x_t + v_pred_raw * dt
                 
