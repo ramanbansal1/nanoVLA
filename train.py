@@ -131,7 +131,7 @@ def setup_dataloader(config):
     return train_loader, val_loader, test_loader, obs_dim, action_dim
 
 
-def loss_fn(model, vlm_out, observation, action, t, noise_key):
+def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     # 1. Action is already in raw space: (B, H, A)
     x_1 = action
     
@@ -158,19 +158,18 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key):
     fm_loss = jnp.mean((pred_v_raw - target_v) ** 2)
     
     # 6. Action Reconstruction Huber Loss
-    action_norm = model.action_norm(action)
-    action_proj = model.action_projector(action_norm)
+    action_proj = model.action_projector(action)
     action_recon = model.action_unembed(action_proj)
     recon_loss = jnp.mean(optax.huber_loss(action_recon, action, delta=1.0))
     
-    loss_val = fm_loss + recon_loss
+    loss_val = fm_loss + lambda_recon * recon_loss
     return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss)
 
 
 @nnx.jit
-def train_step(model, optimizer, vlm_out, observation, action, t, noise_key):
+def train_step(model, optimizer, vlm_out, observation, action, t, noise_key, lambda_recon):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss_val, aux), grads = grad_fn(model, vlm_out, observation, action, t, noise_key)
+    (loss_val, aux), grads = grad_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon)
     optimizer.update(model, grads)
     
     grad_norm = optax.global_norm(grads)
@@ -187,8 +186,8 @@ def train_step(model, optimizer, vlm_out, observation, action, t, noise_key):
 
 
 @nnx.jit
-def eval_step(model, vlm_out, observation, action, t, noise_key):
-    loss_val, aux = loss_fn(model, vlm_out, observation, action, t, noise_key)
+def eval_step(model, vlm_out, observation, action, t, noise_key, lambda_recon):
+    loss_val, aux = loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon)
     return loss_val, aux
 
 
@@ -268,7 +267,7 @@ def main():
                 t = jax.device_put(t, batch_sharding)
                 t3 = time.time()
                 
-                loss_val, aux, grad_norm, comp_grad_norms = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key)
+                loss_val, aux, grad_norm, comp_grad_norms = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key, config.lambda_recon)
                 
                 t4 = time.time()
                 pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss = aux
@@ -349,7 +348,7 @@ def main():
                         if global_step == 100 and val_idx == 0:
                             console.print("[bold cyan]Note: JAX is compiling the validation step for the first time. This may take 3-5 minutes...[/bold cyan]")
                             
-                        val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key)
+                        val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key, config.lambda_recon)
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_losses.append(float(val_loss_val))
                         

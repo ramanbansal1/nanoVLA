@@ -33,16 +33,15 @@ class VLA(nnx.Module):
         
         self.vlm = SigLIP(checkpoint_path=vlm_checkpoint_path, normalize=True)
 
-        self.modulator = Modulator(in_dim=768, out_dim=hidden_size, rngs=rngs)
+        self.modulator = Modulator(in_dim=768, out_dim=hidden_size * 4, rngs=rngs)
         
-        self.action_norm = nnx.InstanceNorm(action_dim, rngs=rngs)
         self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, compression=self.action_compression, rngs=rngs)
         self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, patch_size=patch_size, compression=self.action_compression, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
         
         dit_config = DiTConfig(
             dim=hidden_size,
-            context_dim=hidden_size,
+            context_dim=hidden_size * 4,
             num_heads=6,
             mlp_hidden_dim=hidden_size * 4,
             num_blocks=dit_num_blocks
@@ -97,8 +96,7 @@ class VLA(nnx.Module):
         if action is not None:
             B = obs_emb.shape[0]
             
-            action_norm = self.action_norm(action)
-            action_proj = self.action_projector(action_norm)
+            action_proj = self.action_projector(action)
                 
             _, N, _ = action_proj.shape
             
@@ -144,8 +142,7 @@ class VLA(nnx.Module):
             for k in range(self.vla_k):
                 t_val = jnp.full((B,), k / self.vla_k)
                 
-                x_t_norm = self.action_norm(x_t)
-                action_proj = self.action_projector(x_t_norm)
+                action_proj = self.action_projector(x_t)
                 
                 v_pred_proj = self.dit.cfg(
                     x=action_proj, 
