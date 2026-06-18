@@ -204,22 +204,26 @@ class VideoDataset(Dataset):
                 row["frame_index"],
         }
         
+        use_precomputed = False
         if self.precompute_path is not None:
             repo_name = row["dataset_name"]
             cache_key = f"{repo_name}_{ep_id}"
             
-            if cache_key not in self._vlm_cache:
+            if cache_key in self._vlm_cache:
+                use_precomputed = True
+            else:
                 npz_path = self.precompute_path / repo_name / f"ep_{ep_id}.npz"
                 if npz_path.exists():
                     self._vlm_cache[cache_key] = np.load(npz_path)["vlm_out"]
                     if len(self._vlm_cache) > self._max_cache_size:
                         self._vlm_cache.pop(next(iter(self._vlm_cache)))
-                else:
-                    raise FileNotFoundError(f"Missing precomputed VLM features: {npz_path}")
+                    use_precomputed = True
             
-            relative_idx = idx - ep_start
-            data["vlm_out"] = torch.tensor(self._vlm_cache[cache_key][relative_idx], dtype=torch.float32)
-        else:
+            if use_precomputed:
+                relative_idx = idx - ep_start
+                data["vlm_out"] = torch.tensor(self._vlm_cache[cache_key][relative_idx], dtype=torch.float32)
+
+        if not use_precomputed:
             data["images"] = self._load_images(row)
             
             data["instruction"] = instruction
