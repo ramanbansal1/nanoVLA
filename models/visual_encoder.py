@@ -127,14 +127,27 @@ class SigLIP:
         ptypes = out["pixel_attention_mask"].numpy().astype(np.int32)
         spatial_shapes = out["spatial_shapes"].numpy()
 
-        batch_size, max_patches, _ = pixel_values.shape
+        batch_size, max_patches, patch_dim = pixel_values.shape
+        MAX_PATCHES = 256
+
+        if max_patches > MAX_PATCHES:
+            pixel_values = pixel_values[:, :MAX_PATCHES, :]
+            ptypes = ptypes[:, :MAX_PATCHES]
+            max_patches = MAX_PATCHES
+        elif max_patches < MAX_PATCHES:
+            pad_len = MAX_PATCHES - max_patches
+            pixel_values = np.pad(pixel_values, ((0,0), (0, pad_len), (0,0)), mode='constant')
+            ptypes = np.pad(ptypes, ((0,0), (0, pad_len)), mode='constant')
+            max_patches = MAX_PATCHES
+
         yabs = np.zeros((batch_size, max_patches), dtype=np.int32)
         xabs = np.zeros((batch_size, max_patches), dtype=np.int32)
 
         for i in range(batch_size):
             h, w = spatial_shapes[i]
-            yabs[i, :h * w] = np.repeat(np.arange(h), w)
-            xabs[i, :h * w] = np.tile(np.arange(w), h)
+            valid_len = min(h * w, max_patches)
+            yabs[i, :valid_len] = np.repeat(np.arange(h), w)[:valid_len]
+            xabs[i, :valid_len] = np.tile(np.arange(w), h)[:valid_len]
 
         return (
             pixel_values,
