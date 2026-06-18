@@ -137,10 +137,10 @@ class SigLIP:
             xabs[i, :h * w] = np.tile(np.arange(w), h)
 
         return (
-            jnp.asarray(pixel_values),
-            jnp.asarray(ptypes),
-            jnp.asarray(yabs),
-            jnp.asarray(xabs),
+            pixel_values,
+            ptypes,
+            yabs,
+            xabs,
         )
 
     # ======================================================
@@ -150,7 +150,10 @@ class SigLIP:
         patches, ptype, yabs, xabs = self.images_to_naflex(images)
 
         hidden = self._encode_image_jit(
-            patches, ptype, yabs, xabs
+            jnp.asarray(patches), 
+            jnp.asarray(ptype), 
+            jnp.asarray(yabs), 
+            jnp.asarray(xabs)
         )
 
         return np.asarray(hidden)

@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 from tqdm.auto import tqdm
 import torch 
+import json
 from data.utils import build_episode_lookup, build_instruction
 
 
@@ -52,9 +53,24 @@ class VideoDataset(Dataset):
         self.action_horizon = action_horizon
         self.precompute_path = Path(precompute_path) if precompute_path else None
         
+        self.task_mappings = {}
+        if self.datasets_root.exists():
+            for ds_dir in self.datasets_root.iterdir():
+                if ds_dir.is_dir():
+                    tasks_file = ds_dir / "meta" / "tasks.jsonl"
+                    if tasks_file.exists():
+                        mapping = {}
+                        with open(tasks_file, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                if not line.strip(): continue
+                                d = json.loads(line)
+                                mapping[d["task_index"]] = d["task"]
+                        self.task_mappings[ds_dir.name] = mapping
+
         # Cache for loaded .npz files
         self._vlm_cache = {}
         self._max_cache_size = 10
+        self._token_cache = {}
 
         self.state_dim = len(
             dataset[0]["observation.state"]
@@ -138,9 +154,13 @@ class VideoDataset(Dataset):
         row = self.dataset[idx]
 
         ep_id = row["episode_index"]
+        if "dataset_name" in row:
+            lookup_key = (row["dataset_name"], ep_id)
+        else:
+            lookup_key = ep_id
 
         ep_start, ep_end = (
-            self.episode_ranges[ep_id]
+            self.episode_ranges[lookup_key]
         )
 
         actions = []
@@ -152,7 +172,14 @@ class VideoDataset(Dataset):
             target_row = self.dataset[target_idx]
             actions.append(target_row["action"])
 
-        instruction = build_instruction(row["subtask_annotation"])
+        dataset_name = row.get("dataset_name", "")
+        task_idx = row.get("task_index", -1)
+        
+        if dataset_name in self.task_mappings and task_idx in self.task_mappings[dataset_name]:
+            instruction = self.task_mappings[dataset_name][task_idx]
+        else:
+            # Fallback to old method just in case
+            instruction = build_instruction(row.get("subtask_annotation", None))
         
         data = {
             "observation_state":
@@ -195,15 +222,18 @@ class VideoDataset(Dataset):
         else:
             data["images"] = self._load_images(row)
             
-            instruction = build_instruction(row["subtask_annotation"])
             data["instruction"] = instruction
-            data["input_ids"] = self.tokenizer(
-                instruction,
-                padding="max_length",
-                truncation=True,
-                max_length=64,
-                return_tensors="np",
-            )["input_ids"][0].astype(np.int32)
+            
+            if instruction not in self._token_cache:
+                self._token_cache[instruction] = self.tokenizer(
+                    instruction,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=64,
+                    return_tensors="np",
+                )["input_ids"][0].astype(np.int32)
+                
+            data["input_ids"] = self._token_cache[instruction]
             
         return data
         """

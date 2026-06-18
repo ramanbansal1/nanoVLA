@@ -33,23 +33,29 @@ def build_episode_lookup(dataset):
     """
     Returns:
         {
-            episode_id: (start_row, end_row)
+            (dataset_name, episode_id): (start_row, end_row)
         }
     """
     episodes = dataset["episode_index"]
+    
+    if "dataset_name" in dataset.column_names:
+        dataset_names = dataset["dataset_name"]
+        keys = [(dname, ep) for dname, ep in zip(dataset_names, episodes)]
+    else:
+        keys = episodes
 
     lookup = {}
 
-    for row_idx, ep in enumerate(episodes):
+    for row_idx, key in enumerate(keys):
 
-        if ep not in lookup:
-            lookup[ep] = [row_idx, row_idx]
+        if key not in lookup:
+            lookup[key] = [row_idx, row_idx]
         else:
-            lookup[ep][1] = row_idx
+            lookup[key][1] = row_idx
 
     return {
-        ep: (start, end)
-        for ep, (start, end) in lookup.items()
+        k: (start, end)
+        for k, (start, end) in lookup.items()
     }
 
 SUBTASK_MAP = {

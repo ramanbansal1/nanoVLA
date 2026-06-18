@@ -23,6 +23,7 @@ import threading
 import concurrent.futures
 from pathlib import Path
 
+import wandb
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -125,6 +126,8 @@ class MultiGPUEncoder:
 
     # ------------------------------------------------------------------
     def _warmup(self, vlm: SigLIP):
+        print("[MultiGPUEncoder] Starting JIT compilation (pmap warm-up)...")
+        t0 = time.perf_counter()
         n = self.n_devices
         dummy_patches = jnp.zeros((n, 1, 256, 768), dtype=jnp.float32)
         dummy_ptype   = jnp.ones ((n, 1, 256),      dtype=jnp.int32)
@@ -136,13 +139,16 @@ class MultiGPUEncoder:
         r.block_until_ready()
         r = self._pmap_txt(dummy_ids)
         r.block_until_ready()
-        print("[MultiGPUEncoder] pmap warm-up done.")
+        print(f"[MultiGPUEncoder] pmap warm-up done in {time.perf_counter() - t0:.2f}s.")
 
     # ------------------------------------------------------------------
     def encode_batch(
         self,
-        pil_images: list,
-        input_ids:  np.ndarray,   # (B, T)  int32
+        patches: np.ndarray,
+        ptype: np.ndarray,
+        yabs: np.ndarray,
+        xabs: np.ndarray,
+        input_ids: np.ndarray,
     ) -> np.ndarray:              # (B, T+Npatches, D)
         """
         Encode a batch of images + texts using ALL GPUs via pmap.
@@ -151,12 +157,6 @@ class MultiGPUEncoder:
         unsharded, and trimmed back to the original batch size.
         """
         n = self.n_devices
-
-        # ── IMAGE preprocessing (CPU) ──────────────────────────────────
-        patches, ptype, yabs, xabs = self.vlm.images_to_naflex(pil_images)
-        # patches: (B, Npatches, D)  etc.
-
-        # ── Pad & shard ───────────────────────────────────────────────
         B_orig = patches.shape[0]
 
         def pad_shard(arr):
@@ -231,13 +231,12 @@ def _prefetch_episode(
     ep_end:   int,
     video_dataset: VideoDataset,
     batch_size: int,
-) -> list[tuple[list, np.ndarray]]:
+    vlm,
+) -> list[tuple]:
     """
     Load ALL steps of one episode into CPU RAM and split into batches.
     Runs in a background thread so the next episode is ready when GPUs finish
     the current one.
-
-    Returns a list of (pil_images, input_ids_array) tuples.
     """
     images_acc  = []
     ids_acc     = []
@@ -245,7 +244,11 @@ def _prefetch_episode(
 
     def flush():
         if images_acc:
-            batches.append((list(images_acc), np.stack(ids_acc, axis=0)))
+            patches, ptype, yabs, xabs = vlm.images_to_naflex(images_acc)
+            batches.append((
+                patches, ptype, yabs, xabs,
+                np.stack(ids_acc, axis=0)
+            ))
             images_acc.clear()
             ids_acc.clear()
 
@@ -273,6 +276,7 @@ def _prefetch_episode(
 
 def main():
     config = parse_args()
+    wandb.init(project="nanovla-precompute", config=config)
 
     precompute_path = Path(config.precompute_path)
     precompute_path.mkdir(parents=True, exist_ok=True)
@@ -321,15 +325,14 @@ def main():
     global_bs    = per_gpu_bs * n_dev
 
     # Filter out already-done episodes
-    todo_episodes = {
-        ep_id: rng
-        for ep_id, rng in episodes.items()
-        if not (
-            precompute_path
-            / combined_hf_dataset[rng[0]]["dataset_name"]
-            / f"ep_{ep_id}.npz"
-        ).exists()
-    }
+    todo_episodes = {}
+    for ep_key, rng in episodes.items():
+        repo_name = combined_hf_dataset[rng[0]]["dataset_name"]
+        ep_id = ep_key[1] if isinstance(ep_key, tuple) else ep_key
+        
+        if not (precompute_path / repo_name / f"ep_{ep_id}.npz").exists():
+            todo_episodes[ep_key] = rng
+
     print(f"Episodes remaining: {len(todo_episodes):,}  "
           f"(skipping {len(episodes) - len(todo_episodes):,} already done)")
 
@@ -342,13 +345,19 @@ def main():
 
     # ── Double-buffered prefetch + async save ──────────────────────────────
     # Prefetch queue: holds (ep_id, repo_name, batches) for the NEXT episode
-    prefetch_q: queue.Queue = queue.Queue(maxsize=2)
+    prefetch_q: queue.Queue = queue.Queue(maxsize=4)
+
+    def process_ep(item):
+        ep_key, (ep_start, ep_end) = item
+        repo_name = combined_hf_dataset[ep_start]["dataset_name"]
+        ep_id = ep_key[1] if isinstance(ep_key, tuple) else ep_key
+        batches = _prefetch_episode(ep_start, ep_end, video_dataset, global_bs, vlm)
+        return (ep_id, repo_name, batches)
 
     def _prefetch_worker():
-        for ep_id, (ep_start, ep_end) in ep_items:
-            repo_name = combined_hf_dataset[ep_start]["dataset_name"]
-            batches   = _prefetch_episode(ep_start, ep_end, video_dataset, global_bs)
-            prefetch_q.put((ep_id, repo_name, batches))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for result in pool.map(process_ep, ep_items):
+                prefetch_q.put(result)
         prefetch_q.put(None)  # sentinel
 
     prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
@@ -357,8 +366,11 @@ def main():
     t0 = time.perf_counter()
     steps_done = 0
 
+    total_frames = sum(rng[1] - rng[0] + 1 for rng in todo_episodes.values())
+    
     with AsyncSaver(max_workers=2) as saver, \
-         tqdm(total=total_eps, desc="Episodes", unit="ep") as pbar:
+         tqdm(total=total_eps, desc="Episodes", unit="ep", position=0) as pbar_ep, \
+         tqdm(total=total_frames, desc="Frames", unit="fr", position=1) as pbar_fr:
 
         while True:
             item = prefetch_q.get()
@@ -372,23 +384,31 @@ def main():
             save_path = save_dir / f"ep_{ep_id}.npz"
 
             ep_vlm_outs = []
-            for pil_images, input_ids in batches:
-                vlm_out = encoder.encode_batch(pil_images, input_ids)
+            for patches, ptype, yabs, xabs, input_ids in batches:
+                vlm_out = encoder.encode_batch(patches, ptype, yabs, xabs, input_ids)
                 ep_vlm_outs.append(vlm_out)
-                steps_done += len(pil_images)
+                num_frames = patches.shape[0]
+                steps_done += num_frames
+                pbar_fr.update(num_frames)
 
             episode_vlm_out = np.concatenate(ep_vlm_outs, axis=0)
             saver.save(save_path, episode_vlm_out)
 
             elapsed = time.perf_counter() - t0
-            pbar.set_postfix(
-                steps=steps_done,
+            pbar_ep.set_postfix(
                 steps_s=f"{steps_done / elapsed:.1f}",
                 repo=repo_name[:20],
             )
-            pbar.update(1)
+            pbar_ep.update(1)
+            
+            wandb.log({
+                "steps": steps_done,
+                "steps_per_sec": steps_done / elapsed,
+                "episodes_done": pbar_ep.n,
+            })
 
     prefetch_thread.join()
+    wandb.finish()
     print(f"\nDone — {steps_done:,} steps in {time.perf_counter() - t0:.1f}s "
           f"({steps_done / (time.perf_counter() - t0):.1f} steps/s)")
 
