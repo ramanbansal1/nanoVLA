@@ -190,12 +190,24 @@ class MultiGPUEncoder:
         img_hidden.block_until_ready()
         txt_hidden.block_until_ready()
 
-        # ── Unshard & trim ────────────────────────────────────────────
-        img_np = np.asarray(unshard(img_hidden))[:B_orig]  # (B_orig, Np, D)
-        txt_np = np.asarray(unshard(txt_hidden))[:B_orig]  # (B_orig, T,  D)
+        # Unshard: (n_devices, per_gpu_bs, ...) -> (global_bs, ...)
+        img_np = np.asarray(img_hidden).reshape(-1, img_hidden.shape[-2], img_hidden.shape[-1])
+        txt_np = np.asarray(txt_hidden).reshape(-1, txt_hidden.shape[-2], txt_hidden.shape[-1])
 
-        # Concat along sequence dim: (B, T+Np, D)
-        return np.concatenate([txt_np, img_np], axis=1)
+        # Free JAX device buffers immediately to prevent memory ballooning
+        img_hidden.delete()
+        txt_hidden.delete()
+        s_patches.delete()
+        s_ptype.delete()
+        s_yabs.delete()
+        s_xabs.delete()
+        s_ids.delete()
+
+        # Concatenate on the text dim (B, max_text_length + max_patches, D)
+        out = np.concatenate([txt_np, img_np], axis=1)
+
+        # Trim back to B_orig
+        return out[:B_orig]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -224,52 +236,87 @@ class AsyncSaver:
     def __exit__(self, *_): self.flush(); self._pool.shutdown(wait=True)
 
 
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoProcessor
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Prefetch pipeline
+# Prefetch pipeline via PyTorch DataLoader (Multi-Process)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _prefetch_episode(
-    ep_start: int,
-    ep_end:   int,
-    video_dataset: VideoDataset,
-    batch_size: int,
-    vlm,
-) -> list[tuple]:
-    """
-    Load ALL steps of one episode into CPU RAM and split into batches.
-    Runs in a background thread so the next episode is ready when GPUs finish
-    the current one.
-    """
-    images_acc  = []
-    ids_acc     = []
-    batches     = []
+class EpisodePrecomputeDataset(Dataset):
+    def __init__(self, video_dataset, ep_items, global_bs):
+        self.video_dataset = video_dataset
+        self.ep_items = ep_items
+        self.global_bs = global_bs
+        self.processor = None
 
-    def flush():
-        if images_acc:
-            patches, ptype, yabs, xabs = vlm.images_to_naflex(images_acc)
-            batches.append((
-                patches, ptype, yabs, xabs,
-                np.stack(ids_acc, axis=0)
-            ))
-            images_acc.clear()
-            ids_acc.clear()
+    def __len__(self):
+        return len(self.ep_items)
 
-    for i in range(ep_start, ep_end + 1):
-        data = video_dataset[i]
+    def _images_to_naflex(self, images):
+        if self.processor is None:
+            self.processor = AutoProcessor.from_pretrained("google/siglip2-base-patch16-naflex")
+            
+        out = self.processor(images=images, return_tensors="pt", padding=True)
+        pixel_values = out["pixel_values"].numpy()
+        ptypes = out["pixel_attention_mask"].numpy().astype(np.int32)
+        spatial_shapes = out["spatial_shapes"].numpy()
 
-        img_dict = data["images"]
-        if "default_cam" in img_dict:
-            pil = img_dict["default_cam"]
-        else:
-            pil = next(iter(img_dict.values()))
-        images_acc.append(pil)
-        ids_acc.append(np.asarray(data["input_ids"]))
+        batch_size, max_patches, patch_dim = pixel_values.shape
+        MAX_PATCHES = 256
 
-        if len(images_acc) == batch_size:
-            flush()
+        if max_patches > MAX_PATCHES:
+            pixel_values = pixel_values[:, :MAX_PATCHES, :]
+            ptypes = ptypes[:, :MAX_PATCHES]
+            max_patches = MAX_PATCHES
+        elif max_patches < MAX_PATCHES:
+            pad_len = MAX_PATCHES - max_patches
+            pixel_values = np.pad(pixel_values, ((0,0), (0, pad_len), (0,0)), mode='constant')
+            ptypes = np.pad(ptypes, ((0,0), (0, pad_len)), mode='constant')
+            max_patches = MAX_PATCHES
 
-    flush()  # remainder
-    return batches
+        yabs = np.zeros((batch_size, max_patches), dtype=np.int32)
+        xabs = np.zeros((batch_size, max_patches), dtype=np.int32)
+
+        for i in range(batch_size):
+            h, w = spatial_shapes[i]
+            valid_len = min(h * w, max_patches)
+            yabs[i, :valid_len] = np.repeat(np.arange(h), w)[:valid_len]
+            xabs[i, :valid_len] = np.tile(np.arange(w), h)[:valid_len]
+
+        return pixel_values, ptypes, yabs, xabs
+
+    def __getitem__(self, idx):
+        ep_key, (ep_start, ep_end) = self.ep_items[idx]
+        repo_name = self.video_dataset.dataset[ep_start]["dataset_name"]
+        ep_id = ep_key[1] if isinstance(ep_key, tuple) else ep_key
+
+        images_acc = []
+        ids_acc = []
+        batches = []
+
+        def flush():
+            if images_acc:
+                patches, ptype, yabs, xabs = self._images_to_naflex(images_acc)
+                batches.append((
+                    patches, ptype, yabs, xabs,
+                    np.stack(ids_acc, axis=0)
+                ))
+                images_acc.clear()
+                ids_acc.clear()
+
+        for i in range(ep_start, ep_end + 1):
+            data = self.video_dataset[i]
+            img_dict = data["images"]
+            pil = img_dict.get("default_cam", next(iter(img_dict.values())))
+            images_acc.append(pil)
+            ids_acc.append(np.asarray(data["input_ids"]))
+
+            if len(images_acc) == self.global_bs:
+                flush()
+
+        flush()
+        return ep_id, repo_name, batches
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -345,25 +392,15 @@ def main():
     ep_items   = list(todo_episodes.items())
     total_eps  = len(ep_items)
 
-    # ── Double-buffered prefetch + async save ──────────────────────────────
-    # Prefetch queue: holds (ep_id, repo_name, batches) for the NEXT episode
-    prefetch_q: queue.Queue = queue.Queue(maxsize=4)
-
-    def process_ep(item):
-        ep_key, (ep_start, ep_end) = item
-        repo_name = combined_hf_dataset[ep_start]["dataset_name"]
-        ep_id = ep_key[1] if isinstance(ep_key, tuple) else ep_key
-        batches = _prefetch_episode(ep_start, ep_end, video_dataset, global_bs, vlm)
-        return (ep_id, repo_name, batches)
-
-    def _prefetch_worker():
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            for result in pool.map(process_ep, ep_items):
-                prefetch_q.put(result)
-        prefetch_q.put(None)  # sentinel
-
-    prefetch_thread = threading.Thread(target=_prefetch_worker, daemon=True)
-    prefetch_thread.start()
+    ep_dataset = EpisodePrecomputeDataset(video_dataset, ep_items, global_bs)
+    dataloader = DataLoader(
+        ep_dataset,
+        batch_size=1,
+        num_workers=8,
+        prefetch_factor=2,
+        shuffle=False,
+        collate_fn=lambda x: x[0],
+    )
 
     t0 = time.perf_counter()
     steps_done = 0
@@ -374,12 +411,7 @@ def main():
          tqdm(total=total_eps, desc="Episodes", unit="ep", position=0) as pbar_ep, \
          tqdm(total=total_frames, desc="Frames", unit="fr", position=1) as pbar_fr:
 
-        while True:
-            item = prefetch_q.get()
-            if item is None:
-                break
-
-            ep_id, repo_name, batches = item
+        for ep_id, repo_name, batches in dataloader:
 
             save_dir  = precompute_path / repo_name
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -409,7 +441,6 @@ def main():
                 "episodes_done": pbar_ep.n,
             })
 
-    prefetch_thread.join()
     wandb.finish()
     print(f"\nDone — {steps_done:,} steps in {time.perf_counter() - t0:.1f}s "
           f"({steps_done / (time.perf_counter() - t0):.1f} steps/s)")
