@@ -102,9 +102,11 @@ def _pmap_encode_text(input_ids):
 class MultiGPUEncoder:
     """Wraps pmap-compiled image+text encoders."""
 
-    def __init__(self, vlm: SigLIP):
+    def __init__(self, vlm: SigLIP, per_gpu_bs: int):
         self.vlm       = vlm
         self.n_devices = jax.device_count()
+        self.per_gpu_bs = per_gpu_bs
+        self.global_bs = self.n_devices * per_gpu_bs
         print(f"[MultiGPUEncoder] Detected {self.n_devices} device(s): "
               f"{[str(d) for d in jax.devices()]}")
 
@@ -122,18 +124,18 @@ class MultiGPUEncoder:
         self._pmap_txt = jax.pmap(_pmap_encode_text,  axis_name="batch")
 
         # Warm up with dummy data so first real call has no compile latency
-        self._warmup(vlm)
+        self._warmup(vlm, per_gpu_bs)
 
     # ------------------------------------------------------------------
-    def _warmup(self, vlm: SigLIP):
-        print("[MultiGPUEncoder] Starting JIT compilation (pmap warm-up)...")
+    def _warmup(self, vlm: SigLIP, per_gpu_bs: int):
+        print(f"[MultiGPUEncoder] Starting JIT compilation (pmap warm-up) for local batch {per_gpu_bs}...")
         t0 = time.perf_counter()
         n = self.n_devices
-        dummy_patches = jnp.zeros((n, 1, 256, 768), dtype=jnp.float32)
-        dummy_ptype   = jnp.ones ((n, 1, 256),      dtype=jnp.int32)
-        dummy_yabs    = jnp.zeros((n, 1, 256),      dtype=jnp.int32)
-        dummy_xabs    = jnp.zeros((n, 1, 256),      dtype=jnp.int32)
-        dummy_ids     = jnp.zeros((n, 1, vlm.max_text_length), dtype=jnp.int32)
+        dummy_patches = jnp.zeros((n, per_gpu_bs, 256, 768), dtype=jnp.float32)
+        dummy_ptype   = jnp.ones ((n, per_gpu_bs, 256),      dtype=jnp.int32)
+        dummy_yabs    = jnp.zeros((n, per_gpu_bs, 256),      dtype=jnp.int32)
+        dummy_xabs    = jnp.zeros((n, per_gpu_bs, 256),      dtype=jnp.int32)
+        dummy_ids     = jnp.zeros((n, per_gpu_bs, vlm.max_text_length), dtype=jnp.int32)
 
         r = self._pmap_img(dummy_patches, dummy_ptype, dummy_yabs, dummy_xabs)
         r.block_until_ready()
@@ -153,19 +155,19 @@ class MultiGPUEncoder:
         """
         Encode a batch of images + texts using ALL GPUs via pmap.
 
-        The batch is padded to a multiple of n_devices, sharded, encoded,
+        The batch is padded to exactly global_bs, sharded, encoded,
         unsharded, and trimmed back to the original batch size.
         """
         n = self.n_devices
         B_orig = patches.shape[0]
 
-        def pad_shard(arr):
-            arr_np = np.asarray(arr)
-            remainder = B_orig % n
-            if remainder:
-                pad_n  = n - remainder
+        def pad_shard(arr_np):
+            if B_orig < self.global_bs:
+                pad_n  = self.global_bs - B_orig
                 pad    = np.repeat(arr_np[-1:], pad_n, axis=0)
                 arr_np = np.concatenate([arr_np, pad], axis=0)
+            elif B_orig > self.global_bs:
+                raise ValueError(f"Batch {B_orig} > global {self.global_bs}")
             return shard(arr_np, n)
 
         s_patches = jnp.asarray(pad_shard(patches))
@@ -285,9 +287,14 @@ def main():
     print("Loading VLM Model …")
     vlm = SigLIP(checkpoint_path=config.vlm_checkpoint_path, normalize=True)
 
+    # Batch size per pmap call – scale with number of GPUs
+    # Use config.batch_size as the *per-GPU* batch size
+    per_gpu_bs   = config.batch_size
+
     # ── Wrap with multi-GPU encoder ────────────────────────────────────────
-    encoder = MultiGPUEncoder(vlm)
+    encoder = MultiGPUEncoder(vlm, per_gpu_bs)
     n_dev   = encoder.n_devices
+    global_bs    = per_gpu_bs * n_dev
 
     # ── Load datasets ──────────────────────────────────────────────────────
     print("Loading datasets …")
@@ -318,11 +325,6 @@ def main():
 
     episodes = video_dataset.episode_ranges
     print(f"Episodes to precompute: {len(episodes):,}")
-
-    # Batch size per pmap call – scale with number of GPUs
-    # Use config.batch_size as the *per-GPU* batch size
-    per_gpu_bs   = config.batch_size
-    global_bs    = per_gpu_bs * n_dev
 
     # Filter out already-done episodes
     todo_episodes = {}
