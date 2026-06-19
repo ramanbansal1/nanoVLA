@@ -67,9 +67,7 @@ class VideoDataset(Dataset):
                                 mapping[d["task_index"]] = d["task"]
                         self.task_mappings[ds_dir.name] = mapping
 
-        # Cache for loaded .npz files
-        self._vlm_cache = {}
-        self._max_cache_size = 10
+        # Cache for tokenization
         self._token_cache = {}
 
         self.state_dim = len(
@@ -207,21 +205,23 @@ class VideoDataset(Dataset):
         use_precomputed = False
         if self.precompute_path is not None:
             repo_name = row["dataset_name"]
-            cache_key = f"{repo_name}_{ep_id}"
+            frame_idx = row["frame_index"]
             
-            if cache_key in self._vlm_cache:
-                use_precomputed = True
-            else:
-                npz_path = self.precompute_path / repo_name / f"ep_{ep_id}.npz"
-                if npz_path.exists():
-                    self._vlm_cache[cache_key] = np.load(npz_path)["vlm_out"]
-                    if len(self._vlm_cache) > self._max_cache_size:
-                        self._vlm_cache.pop(next(iter(self._vlm_cache)))
+            npz_path = self.precompute_path / repo_name / f"ep_{ep_id}" / f"{frame_idx:06d}.npz"
+            
+            if npz_path.exists():
+                try:
+                    loaded = np.load(npz_path)
+                    img_hidden = loaded["img_hidden"]
+                    txt_hidden = loaded["txt_hidden"]
+                    
+                    # Concatenate to match the expected VLA format: (T_text + N_patches, D)
+                    vlm_out = np.concatenate([txt_hidden, img_hidden], axis=0)
+                    data["vlm_out"] = torch.tensor(vlm_out, dtype=torch.float32)
                     use_precomputed = True
-            
-            if use_precomputed:
-                relative_idx = idx - ep_start
-                data["vlm_out"] = torch.tensor(self._vlm_cache[cache_key][relative_idx], dtype=torch.float32)
+                except Exception as e:
+                    # Fallback to online compute if the file is corrupted
+                    pass
 
         if not use_precomputed:
             data["images"] = self._load_images(row)

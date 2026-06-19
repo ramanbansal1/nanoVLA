@@ -35,8 +35,8 @@ class VLA(nnx.Module):
 
         self.modulator = Modulator(in_dim=768, out_dim=hidden_size * 4, rngs=rngs)
         
-        self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, compression=self.action_compression, rngs=rngs)
-        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, patch_size=patch_size, compression=self.action_compression, rngs=rngs)
+        self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, rngs=rngs)
+        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, patch_size=patch_size, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
         
         dit_config = DiTConfig(
