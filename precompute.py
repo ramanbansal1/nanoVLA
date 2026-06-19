@@ -47,15 +47,26 @@ def main():
     
     console.print("[bold cyan]Setting up dataloader...[/bold cyan]")
     
-    # Use train_loader exactly as it's configured in train.py
-    train_loader, _, _, _, _ = setup_dataloader(config)
-
-    # [NEW] Re-wrap the dataset in a SEQUENTIAL loader to ensure every frame is saved in order!
+    console.print("[bold cyan]Loading full dataset for precomputation...[/bold cyan]")
+    from train import prepare_datasets, custom_collate_fn
+    from data.advanced_dataset import VideoDataset
     from torch.utils.data import DataLoader
-    from train import custom_collate_fn
+    from datasets import concatenate_datasets
+    
+    # Load all splits and concatenate them into one massive dataset
+    train_ds, val_ds, test_ds = prepare_datasets(config.datasets_root)
+    all_ds = [ds for ds in [train_ds, val_ds, test_ds] if ds is not None]
+    full_hf_dataset = concatenate_datasets(all_ds)
+    
+    full_video_dataset = VideoDataset(
+        dataset=full_hf_dataset,
+        datasets_root=config.datasets_root,
+        action_horizon=config.action_horizon,
+        precompute_path=None,
+    )
     
     seq_loader = DataLoader(
-        train_loader.dataset,
+        full_video_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -72,7 +83,7 @@ def main():
     mesh = Mesh(jax.devices(), axis_names=('dp',))
     dp_sharding = NamedSharding(mesh, P('dp'))  # Shard across batch dimension
     
-    if train_loader is None:
+    if len(seq_loader) == 0:
         console.print("[bold red]No training data found.[/bold red]")
         return
         
@@ -93,7 +104,21 @@ def main():
         ep_ids = batch.get("episode_id", [-1])
         frame_indices = batch.get("frame_index", [-1])
         
-        # Take the first item in the batch
+        # [NEW] Skip this batch if ALL frames in it are already precomputed
+        all_exist = True
+        for b in range(len(ds_names)):
+            d_name = ds_names[b]
+            e_id = ep_ids[b].item() if hasattr(ep_ids[b], "item") else ep_ids[b]
+            f_idx = frame_indices[b].item() if hasattr(frame_indices[b], "item") else frame_indices[b]
+            if not (out_dir / d_name / f"ep_{e_id}" / f"{f_idx:06d}.npz").exists():
+                all_exist = False
+                break
+                
+        if all_exist:
+            pbar.update(1)
+            continue
+        
+        # Take the first item in the batch for logging
         ds_name = ds_names[0]
         ep_id = ep_ids[0].item() if hasattr(ep_ids[0], "item") else ep_ids[0]
         
