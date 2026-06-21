@@ -326,16 +326,23 @@ def main():
                 if step % 50 == 0:
                     console.print(f"[dim]Modulator Output | Mean: {mod_mean:.4f} | Std: {mod_std:.4f}[/dim]")
                     
-                    # Generate and log attention heatmap
+                    # Generate and log attention heatmap for all blocks
                     try:
-                        last_attn = all_attns[-1]  # Last DiT block
-                        attn_matrix = last_attn[-1]  # Last element in the batch
-                        attn_matrix_mean = jnp.mean(attn_matrix, axis=0)  # Average across heads
-                        attn_matrix_np = np.array(attn_matrix_mean)
-                        
-                        fig, ax = plt.subplots(figsize=(8, 6))
-                        sns.heatmap(attn_matrix_np, ax=ax, cmap="viridis")
-                        ax.set_title(f"Attention Heatmap (Block {len(all_attns)-1}, Batch Element -1)")
+                        num_blocks = len(all_attns)
+                        fig, axes = plt.subplots(1, num_blocks, figsize=(6 * num_blocks, 6))
+                        if num_blocks == 1:
+                            axes = [axes]
+                            
+                        for i, attn in enumerate(all_attns):
+                            attn_matrix = attn[-1]  # Last element in the batch
+                            attn_matrix_mean = jnp.mean(attn_matrix, axis=0)  # Average across heads
+                            attn_matrix_np = np.array(attn_matrix_mean)
+                            
+                            sns.heatmap(attn_matrix_np, ax=axes[i], cmap="viridis")
+                            axes[i].set_title(f"Block {i}")
+                            
+                        fig.suptitle("Attention Heatmaps (Batch Element -1)", fontsize=16)
+                        plt.tight_layout()
                         log_dict["ob_projector/attention_heatmap"] = wandb.Image(fig)
                         plt.close(fig)
                     except Exception as e:
