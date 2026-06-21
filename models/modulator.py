@@ -20,7 +20,11 @@ class Modulator(nnx.Module):
         h_dim = 2 * out_dim
         
         self.proj1 = nnx.Linear(in_dim, 3 * h_dim, rngs=rngs)
+        self.norm1 = nnx.LayerNorm(3 * h_dim, rngs=rngs)
+        
         self.proj2 = nnx.Linear(3 * h_dim, 2 * h_dim, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(2 * h_dim, rngs=rngs)
+        
         self.proj3 = nnx.Linear(2 * h_dim, out_dim, rngs=rngs)
         
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -29,16 +33,17 @@ class Modulator(nnx.Module):
             x: input array of shape [B, N, in_dim]
             
         Returns:
-            Projected and GELU-activated array of shape [B, N, out_dim]
+            Projected array of shape [B, N, out_dim]
         """
         x = self.proj1(x)
+        x = self.norm1(x)
         x = nnx.gelu(x)
         
         x = self.proj2(x)
+        x = self.norm2(x)
         x = nnx.gelu(x)
         
         x = self.proj3(x)
-        x = nnx.gelu(x)
         
         return x
 

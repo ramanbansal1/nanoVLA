@@ -120,7 +120,7 @@ class VLA(nnx.Module):
                     return_attn=True
                 )
                 pred_v_raw = self.action_unembed(dit_out)
-                return pred_v_raw, all_attns, vlm_modulated
+                return pred_v_raw, all_attns, vlm_modulated, obs_emb, action_proj
             else:
                 dit_out = self.dit(
                     x=action_proj, 

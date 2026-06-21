@@ -17,6 +17,8 @@ import wandb
 import jax
 import jax.numpy as jnp
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 from flax import nnx
 import optax
 import orbax.checkpoint as ocp
@@ -145,7 +147,7 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     # 4. Target Velocity in raw space
     target_v = x_1 - x_0
     
-    pred_v_raw, all_attns, vlm_modulated = model(
+    pred_v_raw, all_attns, vlm_modulated, obs_emb, action_proj = model(
         images=None, 
         input_ids=None, 
         observation=observation, 
@@ -164,7 +166,7 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     recon_loss = jnp.mean(optax.huber_loss(action_recon, action, delta=1.0))
     
     loss_val = fm_loss + lambda_recon * recon_loss
-    return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss, all_attns, vlm_modulated)
+    return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss, vlm_modulated, obs_emb, action_proj, all_attns)
 
 
 @nnx.jit
@@ -271,7 +273,7 @@ def main():
                 loss_val, aux, grad_norm, comp_grad_norms = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key, config.lambda_recon)
                 
                 t4 = time.time()
-                pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss, all_attns, vlm_modulated = aux
+                pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss, vlm_modulated, obs_emb, action_proj, all_attns = aux
                 
                 loss_val = jax.block_until_ready(loss_val)
                 t5 = time.time()
@@ -294,7 +296,6 @@ def main():
 
                 log_dict = {
                     "train/loss": float(loss_val),
-                    "train/fm_loss": float(fm_loss),
                     "train/recon_loss": float(recon_loss),
                     "train/grad_norm": float(grad_norm),
                     "train/max_relative_bias": float(max_relative_bias),
@@ -304,20 +305,41 @@ def main():
                     "train/lr": float(schedule(global_step))
                 }
                 
-                # Add observation attention to log_dict
-                for block_idx, attn in enumerate(all_attns):
-                    obs_attention = attn[:, :, :, 0]
-                    mean_obs_attn = jnp.mean(obs_attention)
-                    log_dict[f"ob_projector/block_{block_idx}_obs_attention"] = float(mean_obs_attn)
-                    
                 # Add modulator output mean and std
                 mod_mean = jnp.mean(vlm_modulated)
                 mod_std = jnp.std(vlm_modulated)
                 log_dict["ob_projector/mod_out_mean"] = float(mod_mean)
                 log_dict["ob_projector/mod_out_std"] = float(mod_std)
                 
+                # Add observation embedding mean and std
+                obs_mean = jnp.mean(obs_emb)
+                obs_std = jnp.std(obs_emb)
+                log_dict["ob_projector/obs_emb_mean"] = float(obs_mean)
+                log_dict["ob_projector/obs_emb_std"] = float(obs_std)
+                
+                # Add action embedding mean and std
+                act_mean = jnp.mean(action_proj)
+                act_std = jnp.std(action_proj)
+                log_dict["ob_projector/action_emb_mean"] = float(act_mean)
+                log_dict["ob_projector/action_emb_std"] = float(act_std)
+                
                 if step % 50 == 0:
                     console.print(f"[dim]Modulator Output | Mean: {mod_mean:.4f} | Std: {mod_std:.4f}[/dim]")
+                    
+                    # Generate and log attention heatmap
+                    try:
+                        last_attn = all_attns[-1]  # Last DiT block
+                        attn_matrix = last_attn[-1]  # Last element in the batch
+                        attn_matrix_mean = jnp.mean(attn_matrix, axis=0)  # Average across heads
+                        attn_matrix_np = np.array(attn_matrix_mean)
+                        
+                        fig, ax = plt.subplots(figsize=(8, 6))
+                        sns.heatmap(attn_matrix_np, ax=ax, cmap="viridis")
+                        ax.set_title(f"Attention Heatmap (Block {len(all_attns)-1}, Batch Element -1)")
+                        log_dict["ob_projector/attention_heatmap"] = wandb.Image(fig)
+                        plt.close(fig)
+                    except Exception as e:
+                        console.print(f"[red]Failed to generate heatmap: {e}[/red]")
                 
                 for comp_name, norm_val in comp_grad_norms.items():
                     log_dict[f"grad/{comp_name}"] = float(norm_val)
@@ -374,7 +396,7 @@ def main():
                         val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key, config.lambda_recon)
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_losses.append(float(val_loss_val))
-                        val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss, val_all_attns, val_vlm_modulated = val_aux
+                        val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss, val_vlm_modulated, val_obs_emb, val_action_proj, val_all_attns = val_aux
                         val_fm_losses.append(float(val_fm_loss))
                         val_recon_losses.append(float(val_recon_loss))
                         val_per_dim_bias = jnp.mean(val_pred_v_raw - val_target_v_raw, axis=(0, 1))
@@ -401,10 +423,9 @@ def main():
                         mean_val_max_relative_bias = float(np.mean(val_max_relative_biases))
                         mean_val_max_relative_mae = float(np.mean(val_max_relative_maes))
                         
-                        console.print(f"[bold magenta]Step {global_step} - Validation Loss: {mean_val_loss:.4f} (FM: {mean_val_fm_loss:.4f}, Recon: {mean_val_recon_loss:.4f})[/bold magenta]\n")
+                        console.print(f"[bold magenta]Step {global_step} - Validation Loss: {mean_val_loss:.4f} (Recon: {mean_val_recon_loss:.4f})[/bold magenta]\n")
                         wandb.log({
                             "val/loss": mean_val_loss,
-                            "val/fm_loss": mean_val_fm_loss,
                             "val/recon_loss": mean_val_recon_loss,
                             "val/correlation": mean_val_correlation,
                             "val/max_relative_bias": mean_val_max_relative_bias,
