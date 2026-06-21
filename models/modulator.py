@@ -14,8 +14,14 @@ class Modulator(nnx.Module):
         self.in_dim = in_dim
         self.out_dim = out_dim
         
-        # Linear layer to project the input to the target dimension
-        self.proj = nnx.Linear(in_dim, out_dim, rngs=rngs)
+        # User requested: add 2 layers, gradually decreasing.
+        # "hidden size 3, hidden size 2, then hidden size"
+        # "hidden size is 2 * out dim"
+        h_dim = 2 * out_dim
+        
+        self.proj1 = nnx.Linear(in_dim, 3 * h_dim, rngs=rngs)
+        self.proj2 = nnx.Linear(3 * h_dim, 2 * h_dim, rngs=rngs)
+        self.proj3 = nnx.Linear(2 * h_dim, out_dim, rngs=rngs)
         
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """
@@ -25,10 +31,13 @@ class Modulator(nnx.Module):
         Returns:
             Projected and GELU-activated array of shape [B, N, out_dim]
         """
-        # 1. Project: [B, N, in_dim] -> [B, N, out_dim]
-        x = self.proj(x)
+        x = self.proj1(x)
+        x = nnx.gelu(x)
         
-        # 2. GELU activation
+        x = self.proj2(x)
+        x = nnx.gelu(x)
+        
+        x = self.proj3(x)
         x = nnx.gelu(x)
         
         return x

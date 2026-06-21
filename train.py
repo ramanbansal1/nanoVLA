@@ -145,13 +145,14 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     # 4. Target Velocity in raw space
     target_v = x_1 - x_0
     
-    pred_v_raw = model(
+    pred_v_raw, all_attns, vlm_modulated = model(
         images=None, 
         input_ids=None, 
         observation=observation, 
         action=x_t,
         t=t,
-        vlm_out=vlm_out
+        vlm_out=vlm_out,
+        return_attn=True
     )
     
     # 5. MSE Loss on raw velocity
@@ -163,7 +164,7 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     recon_loss = jnp.mean(optax.huber_loss(action_recon, action, delta=1.0))
     
     loss_val = fm_loss + lambda_recon * recon_loss
-    return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss)
+    return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss, all_attns, vlm_modulated)
 
 
 @nnx.jit
@@ -270,7 +271,7 @@ def main():
                 loss_val, aux, grad_norm, comp_grad_norms = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key, config.lambda_recon)
                 
                 t4 = time.time()
-                pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss = aux
+                pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss, all_attns, vlm_modulated = aux
                 
                 loss_val = jax.block_until_ready(loss_val)
                 t5 = time.time()
@@ -281,20 +282,42 @@ def main():
                 # Shape: (action_dim,) — tells you WHICH joints are mispredicted
                 per_dim_bias = jnp.mean(pred_v_raw - target_v_raw, axis=(0, 1))  # (A,)
                 per_dim_mae  = jnp.mean(jnp.abs(pred_v_raw - target_v_raw), axis=(0, 1))
+                per_dim_target_abs_mean = jnp.mean(jnp.abs(target_v_raw), axis=(0, 1)) + 1e-8
 
+                max_relative_mae = jnp.max(per_dim_mae / per_dim_target_abs_mean)
+                max_relative_bias = jnp.max(jnp.abs(per_dim_bias) / per_dim_target_abs_mean)
                 
-                std_ratio = jnp.std(pred_v_raw) / (jnp.std(target_v_raw) + 1e-8)
+                pred_mean = jnp.mean(pred_v_raw)
+                target_mean = jnp.mean(target_v_raw)
+                cov = jnp.mean((pred_v_raw - pred_mean) * (target_v_raw - target_mean))
+                correlation = cov / (jnp.std(pred_v_raw) * jnp.std(target_v_raw) + 1e-8)
+
                 log_dict = {
                     "train/loss": float(loss_val),
                     "train/fm_loss": float(fm_loss),
                     "train/recon_loss": float(recon_loss),
                     "train/grad_norm": float(grad_norm),
-                    "train/max_dim_bias": float(jnp.max(jnp.abs(per_dim_bias))),
-                    "train/std_ratio": float(std_ratio),
-                    "train/max_dim_mae": float(jnp.max(per_dim_mae)),
+                    "train/max_relative_bias": float(max_relative_bias),
+                    "train/correlation": float(correlation),
+                    "train/max_relative_mae": float(max_relative_mae),
                     "epoch": epoch + 1,
                     "train/lr": float(schedule(global_step))
                 }
+                
+                # Add observation attention to log_dict
+                for block_idx, attn in enumerate(all_attns):
+                    obs_attention = attn[:, :, :, 0]
+                    mean_obs_attn = jnp.mean(obs_attention)
+                    log_dict[f"ob_projector/block_{block_idx}_obs_attention"] = float(mean_obs_attn)
+                    
+                # Add modulator output mean and std
+                mod_mean = jnp.mean(vlm_modulated)
+                mod_std = jnp.std(vlm_modulated)
+                log_dict["ob_projector/mod_out_mean"] = float(mod_mean)
+                log_dict["ob_projector/mod_out_std"] = float(mod_std)
+                
+                if step % 50 == 0:
+                    console.print(f"[dim]Modulator Output | Mean: {mod_mean:.4f} | Std: {mod_std:.4f}[/dim]")
                 
                 for comp_name, norm_val in comp_grad_norms.items():
                     log_dict[f"grad/{comp_name}"] = float(norm_val)
@@ -323,9 +346,9 @@ def main():
                     val_losses = []
                     val_fm_losses = []
                     val_recon_losses = []
-                    val_std_ratios = []
-                    val_max_dim_biases = []
-                    val_max_dim_maes = []
+                    val_correlations = []
+                    val_max_relative_biases = []
+                    val_max_relative_maes = []
                     
                     MAX_VAL_BATCHES = 50
                     for val_idx, val_batch in enumerate(val_loader):
@@ -351,34 +374,41 @@ def main():
                         val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key, config.lambda_recon)
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_losses.append(float(val_loss_val))
-                        
-                        val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss = val_aux
+                        val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss, val_all_attns, val_vlm_modulated = val_aux
                         val_fm_losses.append(float(val_fm_loss))
                         val_recon_losses.append(float(val_recon_loss))
                         val_per_dim_bias = jnp.mean(val_pred_v_raw - val_target_v_raw, axis=(0, 1))
                         val_per_dim_mae = jnp.mean(jnp.abs(val_pred_v_raw - val_target_v_raw), axis=(0, 1))
-                        val_std_ratio = jnp.std(val_pred_v_raw) / (jnp.std(val_target_v_raw) + 1e-8)
+                        val_per_dim_target_abs_mean = jnp.mean(jnp.abs(val_target_v_raw), axis=(0, 1)) + 1e-8
                         
-                        val_std_ratios.append(float(val_std_ratio))
-                        val_max_dim_biases.append(float(jnp.max(jnp.abs(val_per_dim_bias))))
-                        val_max_dim_maes.append(float(jnp.max(val_per_dim_mae)))
+                        val_max_relative_mae = jnp.max(val_per_dim_mae / val_per_dim_target_abs_mean)
+                        val_max_relative_bias = jnp.max(jnp.abs(val_per_dim_bias) / val_per_dim_target_abs_mean)
+                        
+                        val_pred_mean = jnp.mean(val_pred_v_raw)
+                        val_target_mean = jnp.mean(val_target_v_raw)
+                        val_cov = jnp.mean((val_pred_v_raw - val_pred_mean) * (val_target_v_raw - val_target_mean))
+                        val_correlation = val_cov / (jnp.std(val_pred_v_raw) * jnp.std(val_target_v_raw) + 1e-8)
+                        
+                        val_correlations.append(float(val_correlation))
+                        val_max_relative_biases.append(float(val_max_relative_bias))
+                        val_max_relative_maes.append(float(val_max_relative_mae))
                     
                     if val_losses:
                         mean_val_loss = float(np.mean(val_losses))
                         mean_val_fm_loss = float(np.mean(val_fm_losses))
                         mean_val_recon_loss = float(np.mean(val_recon_losses))
-                        mean_val_std_ratio = float(np.mean(val_std_ratios))
-                        mean_val_max_dim_bias = float(np.mean(val_max_dim_biases))
-                        mean_val_max_dim_mae = float(np.mean(val_max_dim_maes))
+                        mean_val_correlation = float(np.mean(val_correlations))
+                        mean_val_max_relative_bias = float(np.mean(val_max_relative_biases))
+                        mean_val_max_relative_mae = float(np.mean(val_max_relative_maes))
                         
                         console.print(f"[bold magenta]Step {global_step} - Validation Loss: {mean_val_loss:.4f} (FM: {mean_val_fm_loss:.4f}, Recon: {mean_val_recon_loss:.4f})[/bold magenta]\n")
                         wandb.log({
                             "val/loss": mean_val_loss,
                             "val/fm_loss": mean_val_fm_loss,
                             "val/recon_loss": mean_val_recon_loss,
-                            "val/std_ratio": mean_val_std_ratio,
-                            "val/max_dim_bias": mean_val_max_dim_bias,
-                            "val/max_dim_mae": mean_val_max_dim_mae
+                            "val/correlation": mean_val_correlation,
+                            "val/max_relative_bias": mean_val_max_relative_bias,
+                            "val/max_relative_mae": mean_val_max_relative_mae,
                         }, step=global_step)
                     
                 global_step += 1

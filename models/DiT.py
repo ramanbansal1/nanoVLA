@@ -144,7 +144,7 @@ class SelfAttention(nnx.Module):
         self.qkv = nnx.Linear(dim, dim * 3, rngs=rngs)
         self.out = nnx.Linear(dim, dim, rngs=rngs)
         
-    def __call__(self, x, cos=None, sin=None, mask=None):
+    def __call__(self, x, cos=None, sin=None, mask=None, return_attn=False):
         B, L, D = x.shape
         
         qkv = self.qkv(x)
@@ -168,6 +168,8 @@ class SelfAttention(nnx.Module):
         out = jnp.einsum('bhls,bshd->blhd', attn, v)
         out = out.reshape(B, L, D)
         
+        if return_attn:
+            return self.out(out), attn
         return self.out(out)
 
 
@@ -242,7 +244,7 @@ class DiTBlock(nnx.Module):
             bias_init=nnx.initializers.zeros_init(),
         )
         
-    def __call__(self, x, context, c, cos=None, sin=None, mask=None, context_mask=None):
+    def __call__(self, x, context, c, cos=None, sin=None, mask=None, context_mask=None, return_attn=False):
         # c is the conditioning signal (e.g., timestep embedding)
         modulation_params = self.adaLN_modulation(nnx.silu(c))
         shift_ca, scale_ca, gate_ca, shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
@@ -255,12 +257,19 @@ class DiTBlock(nnx.Module):
         
         # 2. Self Attention
         x_sa = modulate(self.norm2(x), shift_sa, scale_sa)
-        x = x + gate_sa[:, None, :] * self.self_attn(x_sa, cos=cos, sin=sin, mask=mask)
+        if return_attn:
+            sa_out, attn = self.self_attn(x_sa, cos=cos, sin=sin, mask=mask, return_attn=True)
+            x = x + gate_sa[:, None, :] * sa_out
+        else:
+            x = x + gate_sa[:, None, :] * self.self_attn(x_sa, cos=cos, sin=sin, mask=mask)
+            attn = None
         
         # 3. MLP
         x_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
         x = x + gate_mlp[:, None, :] * self.mlp(x_mlp)
         
+        if return_attn:
+            return x, attn
         return x
 
 
@@ -307,7 +316,7 @@ class DiT(nnx.Module):
         )
         
     def __call__(self, x, obs_emb, context, t, cos=None, sin=None, mask=None, context_mask=None, 
-                 cond_drop_prob=0.0, rngs: nnx.Rngs = None):
+                 cond_drop_prob=0.0, rngs: nnx.Rngs = None, return_attn=False):
         """
         Training forward pass with optional condition dropout.
         Args:
@@ -329,22 +338,38 @@ class DiT(nnx.Module):
         
         c = self.timestep_embedder(t)
         
+        all_attns = []
         for block in self.blocks:
-            x = block(
-                x=x, 
-                context=context, 
-                c=c, 
-                cos=cos, 
-                sin=sin, 
-                mask=mask, 
-                context_mask=context_mask
-            )
+            if return_attn:
+                x, attn = block(
+                    x=x, 
+                    context=context, 
+                    c=c, 
+                    cos=cos, 
+                    sin=sin, 
+                    mask=mask, 
+                    context_mask=context_mask,
+                    return_attn=True
+                )
+                all_attns.append(attn)
+            else:
+                x = block(
+                    x=x, 
+                    context=context, 
+                    c=c, 
+                    cos=cos, 
+                    sin=sin, 
+                    mask=mask, 
+                    context_mask=context_mask
+                )
             
         x = self.final_norm(x)
         
         if obs_emb is not None:
             x = x[:, 1:, :]
             
+        if return_attn:
+            return x, all_attns
         return x
 
 

@@ -66,7 +66,7 @@ class VLA(nnx.Module):
         sin = jnp.concatenate([obs_sin, action_sin], axis=1)
         return cos, sin
 
-    def __call__(self, images, input_ids, observation, action=None, t=None, vlm_out=None, key=None, cond_drop_prob=0.0, rngs=None):
+    def __call__(self, images, input_ids, observation, action=None, t=None, vlm_out=None, key=None, cond_drop_prob=0.0, rngs=None, return_attn=False):
         """
         Executes the Vision-Language-Action forward pass, or K-step flow matching if action is None.
         
@@ -106,20 +106,35 @@ class VLA(nnx.Module):
             if t is None:
                 t = jnp.ones((B,))
 
-            dit_out = self.dit(
-                x=action_proj, 
-                obs_emb=obs_emb, 
-                context=vlm_modulated, 
-                t=t, 
-                cos=cos, 
-                sin=sin, 
-                mask=None,
-                cond_drop_prob=cond_drop_prob,
-                rngs=rngs
-            )
-            
-            pred_v_raw = self.action_unembed(dit_out)
-            return pred_v_raw
+            if return_attn:
+                dit_out, all_attns = self.dit(
+                    x=action_proj, 
+                    obs_emb=obs_emb, 
+                    context=vlm_modulated, 
+                    t=t, 
+                    cos=cos, 
+                    sin=sin, 
+                    mask=None,
+                    cond_drop_prob=cond_drop_prob,
+                    rngs=rngs,
+                    return_attn=True
+                )
+                pred_v_raw = self.action_unembed(dit_out)
+                return pred_v_raw, all_attns, vlm_modulated
+            else:
+                dit_out = self.dit(
+                    x=action_proj, 
+                    obs_emb=obs_emb, 
+                    context=vlm_modulated, 
+                    t=t, 
+                    cos=cos, 
+                    sin=sin, 
+                    mask=None,
+                    cond_drop_prob=cond_drop_prob,
+                    rngs=rngs
+                )
+                pred_v_raw = self.action_unembed(dit_out)
+                return pred_v_raw
             
         # Inference / Generation Mode (Continuous Flow Matching Euler steps)
         else:

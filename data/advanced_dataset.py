@@ -220,6 +220,7 @@ class VideoDataset(Dataset):
                     data["vlm_out"] = torch.tensor(vlm_out, dtype=torch.float32)
                     use_precomputed = True
                 except Exception as e:
+                    print(f"Error loading {npz_path}: {e}")
                     # Fallback to online compute if the file is corrupted
                     pass
 
