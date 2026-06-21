@@ -7,7 +7,7 @@ from flax import nnx
 
 class ObsProjector(nnx.Module):
     def __init__(self, obs_dim, hidden_size, rngs: nnx.Rngs):
-        self.linear1 = nnx.Linear(obs_dim, hidden_size * 2, rngs=rngs)
+        self.linear1 = nnx.Linear(obs_dim, hidden_size * 4, rngs=rngs)
         self.layer_norm = nnx.LayerNorm(num_features=hidden_size * 4, rngs=rngs)
         self.gelu = nnx.gelu
         self.linear2 = nnx.Linear(hidden_size * 4, hidden_size * 2, rngs=rngs)
