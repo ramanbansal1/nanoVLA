@@ -23,10 +23,9 @@ from models.DiT import DiT, DiTConfig
 from models.visual_encoder import SigLIP
 
 class VLA(nnx.Module):
-    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, dit_num_blocks: int = 4, vla_k: int = 4, patch_size: int = 5, action_dim: int = 43, horizon: int = 120, vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz", action_compression: int = 5):
+    def __init__(self, hidden_size: int, obs_dim: int, rngs: nnx.Rngs, dit_num_blocks: int = 4, vla_k: int = 4, action_dim: int = 43, horizon: int = 120, vlm_checkpoint_path: str = "checkpoints/siglip2_naflex.npz", action_compression: int = 5):
         self.hidden_size = hidden_size
         self.vla_k = vla_k
-        self.patch_size = patch_size
         self.action_dim = action_dim
         self.horizon = horizon
         self.action_compression = action_compression
@@ -35,8 +34,8 @@ class VLA(nnx.Module):
 
         self.modulator = Modulator(in_dim=768, out_dim=hidden_size * 4, rngs=rngs)
         
-        self.action_projector = ActionProjector(action_dim=action_dim, patch_size=patch_size, hidden_size=hidden_size, rngs=rngs)
-        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, patch_size=patch_size, rngs=rngs)
+        self.action_projector = ActionProjector(action_dim=action_dim, hidden_size=hidden_size, rngs=rngs)
+        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
         
         dit_config = DiTConfig(
@@ -142,7 +141,7 @@ class VLA(nnx.Module):
                 raise ValueError("A PRNG key must be provided for generation.")
             
             B = obs_emb.shape[0]
-            N = self.horizon // self.patch_size
+            N = self.horizon
             
             # Start with random noise in unembedded space
             key, subkey = jax.random.split(key)

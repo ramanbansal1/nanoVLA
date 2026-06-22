@@ -193,6 +193,18 @@ def eval_step(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     loss_val, aux = loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon)
     return loss_val, aux
 
+@nnx.jit
+def val_generate_step(model, vlm_out, observation, noise_key):
+    pred_action = model(
+        images=None, 
+        input_ids=None, 
+        observation=observation, 
+        action=None, 
+        vlm_out=vlm_out,
+        key=noise_key
+    )
+    return pred_action
+
 
 def main():
     config = parse_args()
@@ -208,7 +220,6 @@ def main():
         rngs=rngs, 
         dit_num_blocks=config.dit_num_blocks,
         vla_k=config.vla_k,
-        patch_size=config.patch_size,
         horizon=config.action_horizon,
         action_dim=action_dim,
         vlm_checkpoint_path=config.vlm_checkpoint_path
@@ -259,7 +270,8 @@ def main():
                 
                 key = jax.random.PRNGKey(epoch * len(train_loader) + step)
                 key, noise_key, t_key = jax.random.split(key, 3)
-                t = jax.random.uniform(t_key, shape=(action_jnp.shape[0],))
+                u = jax.random.beta(t_key, 1.5, 1.0, shape=(action_jnp.shape[0],))
+                t = 0.999 * (1.0 - u)
                 
                 t1 = time.time()
                 t2 = time.time()
@@ -378,6 +390,7 @@ def main():
                     val_correlations = []
                     val_max_relative_biases = []
                     val_max_relative_maes = []
+                    val_action_mses = []
                     
                     MAX_VAL_BATCHES = 50
                     for val_idx, val_batch in enumerate(val_loader):
@@ -390,7 +403,8 @@ def main():
                         
                         val_key = jax.random.PRNGKey(epoch * len(val_loader) + val_idx)
                         val_key, val_noise_key, val_t_key = jax.random.split(val_key, 3)
-                        val_t = jax.random.uniform(val_t_key, shape=(val_action_jnp.shape[0],))
+                        val_u = jax.random.beta(val_t_key, 1.5, 1.0, shape=(val_action_jnp.shape[0],))
+                        val_t = 0.999 * (1.0 - val_u)
                         
                         val_vlm_out_jnp = jax.device_put(val_vlm_out_jnp, batch_sharding)
                         val_observation_jnp = jax.device_put(val_observation_jnp, batch_sharding)
@@ -401,22 +415,30 @@ def main():
                             console.print("[bold cyan]Note: JAX is compiling the validation step for the first time. This may take 3-5 minutes...[/bold cyan]")
                             
                         val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key, config.lambda_recon)
+                        val_pred_action = val_generate_step(vla, val_vlm_out_jnp, val_observation_jnp, val_noise_key)
+                        
                         val_loss_val = jax.block_until_ready(val_loss_val)
+                        val_pred_action = jax.block_until_ready(val_pred_action)
+                        
                         val_losses.append(float(val_loss_val))
                         val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss, val_vlm_modulated, val_obs_emb, val_action_proj, val_all_attns = val_aux
-                        val_fm_losses.append(float(val_fm_loss))
                         val_recon_losses.append(float(val_recon_loss))
-                        val_per_dim_bias = jnp.mean(val_pred_v_raw - val_target_v_raw, axis=(0, 1))
-                        val_per_dim_mae = jnp.mean(jnp.abs(val_pred_v_raw - val_target_v_raw), axis=(0, 1))
-                        val_per_dim_target_abs_mean = jnp.mean(jnp.abs(val_target_v_raw), axis=(0, 1)) + 1e-8
+                        
+                        # Multi-step integrated metrics
+                        val_action_mse = jnp.mean((val_pred_action - val_action_jnp) ** 2)
+                        val_action_mses.append(float(val_action_mse))
+                        
+                        val_per_dim_bias = jnp.mean(val_pred_action - val_action_jnp, axis=(0, 1))
+                        val_per_dim_mae = jnp.mean(jnp.abs(val_pred_action - val_action_jnp), axis=(0, 1))
+                        val_per_dim_target_abs_mean = jnp.mean(jnp.abs(val_action_jnp), axis=(0, 1)) + 1e-8
                         
                         val_max_relative_mae = jnp.max(val_per_dim_mae / val_per_dim_target_abs_mean)
                         val_max_relative_bias = jnp.max(jnp.abs(val_per_dim_bias) / val_per_dim_target_abs_mean)
                         
-                        val_pred_mean = jnp.mean(val_pred_v_raw)
-                        val_target_mean = jnp.mean(val_target_v_raw)
-                        val_cov = jnp.mean((val_pred_v_raw - val_pred_mean) * (val_target_v_raw - val_target_mean))
-                        val_correlation = val_cov / (jnp.std(val_pred_v_raw) * jnp.std(val_target_v_raw) + 1e-8)
+                        val_pred_mean = jnp.mean(val_pred_action)
+                        val_target_mean = jnp.mean(val_action_jnp)
+                        val_cov = jnp.mean((val_pred_action - val_pred_mean) * (val_action_jnp - val_target_mean))
+                        val_correlation = val_cov / (jnp.std(val_pred_action) * jnp.std(val_action_jnp) + 1e-8)
                         
                         val_correlations.append(float(val_correlation))
                         val_max_relative_biases.append(float(val_max_relative_bias))
@@ -424,16 +446,17 @@ def main():
                     
                     if val_losses:
                         mean_val_loss = float(np.mean(val_losses))
-                        mean_val_fm_loss = float(np.mean(val_fm_losses))
                         mean_val_recon_loss = float(np.mean(val_recon_losses))
                         mean_val_correlation = float(np.mean(val_correlations))
                         mean_val_max_relative_bias = float(np.mean(val_max_relative_biases))
                         mean_val_max_relative_mae = float(np.mean(val_max_relative_maes))
+                        mean_val_action_mse = float(np.mean(val_action_mses))
                         
-                        console.print(f"[bold magenta]Step {global_step} - Validation Loss: {mean_val_loss:.4f} (Recon: {mean_val_recon_loss:.4f})[/bold magenta]\n")
+                        console.print(f"[bold magenta]Step {global_step} - Val Loss: {mean_val_loss:.4f} | Action MSE: {mean_val_action_mse:.4f} | Recon: {mean_val_recon_loss:.4f}[/bold magenta]\n")
                         wandb.log({
                             "val/loss": mean_val_loss,
                             "val/recon_loss": mean_val_recon_loss,
+                            "val/action_mse": mean_val_action_mse,
                             "val/correlation": mean_val_correlation,
                             "val/max_relative_bias": mean_val_max_relative_bias,
                             "val/max_relative_mae": mean_val_max_relative_mae,

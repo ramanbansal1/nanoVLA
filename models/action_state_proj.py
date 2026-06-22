@@ -27,14 +27,10 @@ class ActionProjector(nnx.Module):
     def __init__(
         self,
         action_dim: int,
-        patch_size: int,
         hidden_size: int,
         rngs: nnx.Rngs,
     ):
-        self.patch_size = patch_size
         self.action_dim = action_dim
-
-        patch_dim = patch_size * action_dim
 
         self.action_norm = nnx.LayerNorm(
             num_features=action_dim,
@@ -42,7 +38,7 @@ class ActionProjector(nnx.Module):
         )
 
         self.linear1 = nnx.Linear(
-            patch_dim,
+            action_dim,
             hidden_size * 2,
             rngs=rngs,
         )
@@ -65,24 +61,12 @@ class ActionProjector(nnx.Module):
         
         x = self.action_norm(x)
 
-        P = self.patch_size
-        N = H // P
-
-        assert H % P == 0
-
-        # (B,H,A) -> (B,N,P,A)
-        x = x.reshape(B, N, P, A)
-
-        # (B,N,P,A) -> (B,N,P*A)
-        x = x.reshape(B, N, P * A)
-
-        # Patch encoder
         x = self.linear1(x)
         x = self.norm(x)
         x = self.gelu(x)
         x = self.linear2(x)
 
-        # (B,N,D)
+        # (B,H,D)
         return x
 
 
@@ -90,14 +74,10 @@ class ActionUnembed(nnx.Module):
     def __init__(
         self,
         action_dim: int,
-        patch_size: int,
         hidden_size: int,
         rngs: nnx.Rngs,
     ):
-        self.patch_size = patch_size
         self.action_dim = action_dim
-
-        patch_dim = patch_size * action_dim
 
         self.linear1 = nnx.Linear(
             hidden_size,
@@ -112,7 +92,7 @@ class ActionUnembed(nnx.Module):
 
         self.linear2 = nnx.Linear(
             hidden_size * 4,
-            patch_dim,
+            action_dim,
             rngs=rngs,
         )
 
@@ -120,27 +100,14 @@ class ActionUnembed(nnx.Module):
         self.out_scale = nnx.Param(jnp.ones((action_dim,)))
 
     def __call__(self, x):
-        B, N, D = x.shape
+        B, H, D = x.shape
 
         x = self.linear1(x)
         x = self.norm(x)
         x = self.gelu(x)
         x = self.linear2(x)
 
-        # (B,N,P*A)
-        x = x.reshape(
-            B,
-            N,
-            self.patch_size,
-            self.action_dim,
-        )
-
         # (B,H,A)
-        x = x.reshape(
-            B,
-            N * self.patch_size,
-            self.action_dim,
-        )
 
         x = x * self.out_scale
 
@@ -173,16 +140,12 @@ if __name__ == "__main__":
 
     print("\n=== ActionProjector ===")
     B, H, A = 16, 60, 14
-    P = 15
     D = 96
-    
-    assert H % P == 0
     
     ap_input = jax.random.normal(jax.random.PRNGKey(123), (B, H, A))
     
     action_projector = ActionProjector(
         action_dim=A,
-        patch_size=P,
         hidden_size=D,
         rngs=rngs,
     )
@@ -190,13 +153,11 @@ if __name__ == "__main__":
     _ = action_projector(ap_input)
 
     print("\n=== ActionUnembed ===")
-    N = H // P
     au_input = action_projector(ap_input)
     
     action_unembed = ActionUnembed(
         action_dim=A,
         hidden_size=D,
-        patch_size=P,
         rngs=rngs,
     )
     

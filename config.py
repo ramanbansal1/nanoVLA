@@ -5,7 +5,6 @@ from dataclasses import dataclass, field, asdict
 class TrainConfig:
     datasets_root: str = "data/datasets"
     action_horizon: int = 25
-    patch_size: int = 5
     batch_size: int = 100
     num_workers: int = 4
     hidden_size: int = 96
@@ -31,8 +30,6 @@ def parse_args() -> TrainConfig:
                         help=f"Path to datasets root directory (default: {default_config.datasets_root})")
     parser.add_argument("--action_horizon", type=int, default=default_config.action_horizon,
                         help=f"Action horizon (default: {default_config.action_horizon})")
-    parser.add_argument("--patch_size", type=int, default=default_config.patch_size,
-                        help=f"Patch size (default: {default_config.patch_size})")
     parser.add_argument("--batch_size", type=int, default=default_config.batch_size,
                         help=f"Batch size (default: {default_config.batch_size})")
     parser.add_argument("--num_workers", type=int, default=default_config.num_workers,
@@ -69,7 +66,6 @@ def parse_args() -> TrainConfig:
     return TrainConfig(
         datasets_root=args.datasets_root,
         action_horizon=args.action_horizon,
-        patch_size=args.patch_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         hidden_size=args.hidden_size,
