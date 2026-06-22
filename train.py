@@ -162,7 +162,7 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     
     # 6. Action Reconstruction Huber Loss
     action_proj = model.action_projector(action)
-    action_recon = model.action_unembed(action_proj)
+    action_recon = model.action_unembed(action_proj, obs_emb)
     recon_loss = jnp.mean(optax.huber_loss(action_recon, action, delta=1.0))
     
     loss_val = fm_loss + lambda_recon * recon_loss
