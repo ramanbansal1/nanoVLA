@@ -19,7 +19,7 @@ import numpy as np
 from flax import nnx
 from models.action_state_proj import ActionProjector, ActionUnembed, ObsProjector
 from models.modulator import Modulator
-from models.DiT import DiT, DiTConfig
+from models.DiT import DiT, DiTConfig, inference_cfg
 from models.visual_encoder import SigLIP
 
 class VLA(nnx.Module):
@@ -158,7 +158,8 @@ class VLA(nnx.Module):
                 
                 action_proj = self.action_projector(x_t)
                 
-                v_pred_proj = self.dit.cfg(
+                v_pred_proj = inference_cfg(
+                    model=self.dit,
                     x=action_proj, 
                     obs_emb=obs_emb, 
                     context=vlm_modulated, 
