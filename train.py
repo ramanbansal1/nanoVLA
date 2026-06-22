@@ -341,19 +341,26 @@ def main():
                     # Generate and log attention heatmap for all blocks
                     try:
                         num_blocks = len(all_attns)
-                        fig, axes = plt.subplots(1, num_blocks, figsize=(6 * num_blocks, 6))
-                        if num_blocks == 1:
-                            axes = [axes]
+                        fig, axes = plt.subplots(2, num_blocks, figsize=(6 * num_blocks, 12), squeeze=False)
                             
-                        for i, attn in enumerate(all_attns):
-                            attn_matrix = attn[-1]  # Last element in the batch
-                            attn_matrix_mean = jnp.mean(attn_matrix, axis=0)  # Average across heads
-                            attn_matrix_np = np.array(attn_matrix_mean)
+                        for i, (sa_attn, ca_attn) in enumerate(all_attns):
+                            # Self attention
+                            sa_matrix = sa_attn[-1]  # Last element in the batch
+                            sa_matrix_mean = jnp.mean(sa_matrix, axis=0)  # Average across heads
+                            sa_matrix_np = np.array(sa_matrix_mean)
                             
-                            sns.heatmap(attn_matrix_np, ax=axes[i], cmap="viridis")
-                            axes[i].set_title(f"Block {i}")
+                            sns.heatmap(sa_matrix_np, ax=axes[0, i], cmap="viridis")
+                            axes[0, i].set_title(f"Self-Attn Block {i}")
                             
-                        fig.suptitle("Attention Heatmaps (Batch Element -1)", fontsize=16)
+                            # Cross attention
+                            ca_matrix = ca_attn[-1]
+                            ca_matrix_mean = jnp.mean(ca_matrix, axis=0)
+                            ca_matrix_np = np.array(ca_matrix_mean)
+                            
+                            sns.heatmap(ca_matrix_np, ax=axes[1, i], cmap="viridis")
+                            axes[1, i].set_title(f"Cross-Attn Block {i}")
+                            
+                        fig.suptitle(f"Step {global_step} Attention Heatmaps (Batch Element -1)", fontsize=16)
                         plt.tight_layout()
                         log_dict["ob_projector/attention_heatmap"] = wandb.Image(fig)
                         plt.close(fig)
@@ -430,7 +437,9 @@ def main():
                         
                         val_per_dim_bias = jnp.mean(val_pred_action - val_action_jnp, axis=(0, 1))
                         val_per_dim_mae = jnp.mean(jnp.abs(val_pred_action - val_action_jnp), axis=(0, 1))
-                        val_per_dim_target_abs_mean = jnp.mean(jnp.abs(val_action_jnp), axis=(0, 1)) + 1e-8
+                        
+                        # Use a floor of 1e-2 to prevent division by zero/near-zero for inactive dimensions
+                        val_per_dim_target_abs_mean = jnp.maximum(jnp.mean(jnp.abs(val_action_jnp), axis=(0, 1)), 1e-2)
                         
                         val_max_relative_mae = jnp.max(val_per_dim_mae / val_per_dim_target_abs_mean)
                         val_max_relative_bias = jnp.max(jnp.abs(val_per_dim_bias) / val_per_dim_target_abs_mean)

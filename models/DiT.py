@@ -188,7 +188,7 @@ class CrossAttention(nnx.Module):
         self.kv = nnx.Linear(context_dim, dim * 2, rngs=rngs)
         self.out = nnx.Linear(dim, dim, rngs=rngs)
         
-    def __call__(self, x, context, mask=None):
+    def __call__(self, x, context, mask=None, return_attn=False):
         B, L, D = x.shape
         _, S, _ = context.shape
         
@@ -210,6 +210,8 @@ class CrossAttention(nnx.Module):
         out = jnp.einsum('bhls,bshd->blhd', attn, v)
         out = out.reshape(B, L, D)
         
+        if return_attn:
+            return self.out(out), attn
         return self.out(out)
 
 
@@ -253,23 +255,28 @@ class DiTBlock(nnx.Module):
         
         # 1. Cross Attention
         x_ca = modulate(self.norm1(x), shift_ca, scale_ca)
-        x = x + gate_ca[:, None, :] * self.cross_attn(x_ca, context, mask=context_mask)
+        if return_attn:
+            ca_out, ca_attn = self.cross_attn(x_ca, context, mask=context_mask, return_attn=True)
+            x = x + gate_ca[:, None, :] * ca_out
+        else:
+            x = x + gate_ca[:, None, :] * self.cross_attn(x_ca, context, mask=context_mask)
+            ca_attn = None
         
         # 2. Self Attention
         x_sa = modulate(self.norm2(x), shift_sa, scale_sa)
         if return_attn:
-            sa_out, attn = self.self_attn(x_sa, cos=cos, sin=sin, mask=mask, return_attn=True)
+            sa_out, sa_attn = self.self_attn(x_sa, cos=cos, sin=sin, mask=mask, return_attn=True)
             x = x + gate_sa[:, None, :] * sa_out
         else:
             x = x + gate_sa[:, None, :] * self.self_attn(x_sa, cos=cos, sin=sin, mask=mask)
-            attn = None
+            sa_attn = None
         
         # 3. MLP
         x_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
         x = x + gate_mlp[:, None, :] * self.mlp(x_mlp)
         
         if return_attn:
-            return x, attn
+            return x, (sa_attn, ca_attn)
         return x
 
 
@@ -365,9 +372,6 @@ class DiT(nnx.Module):
             
         x = self.final_norm(x)
         
-        if obs_emb is not None:
-            x = x[:, 1:, :]
-            
         if return_attn:
             return x, all_attns
         return x

@@ -35,7 +35,7 @@ class VLA(nnx.Module):
         self.modulator = Modulator(in_dim=768, out_dim=hidden_size * 4, rngs=rngs)
         
         self.action_projector = ActionProjector(action_dim=action_dim, hidden_size=hidden_size, rngs=rngs)
-        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, rngs=rngs)
+        self.action_unembed = ActionUnembed(action_dim=action_dim, hidden_size=hidden_size, context_dim=hidden_size, rngs=rngs)
         self.obs_projector = ObsProjector(obs_dim=obs_dim, hidden_size=hidden_size, rngs=rngs)
         
         dit_config = DiTConfig(
@@ -106,7 +106,7 @@ class VLA(nnx.Module):
                 t = jnp.ones((B,))
 
             if return_attn:
-                dit_out, all_attns = self.dit(
+                dit_out_full, all_attns = self.dit(
                     x=action_proj, 
                     obs_emb=obs_emb, 
                     context=vlm_modulated, 
@@ -118,10 +118,12 @@ class VLA(nnx.Module):
                     rngs=rngs,
                     return_attn=True
                 )
-                pred_v_raw = self.action_unembed(dit_out)
+                processed_obs = dit_out_full[:, 0, :]
+                dit_out = dit_out_full[:, 1:, :]
+                pred_v_raw = self.action_unembed(dit_out, processed_obs)
                 return pred_v_raw, all_attns, vlm_modulated, obs_emb, action_proj
             else:
-                dit_out = self.dit(
+                dit_out_full = self.dit(
                     x=action_proj, 
                     obs_emb=obs_emb, 
                     context=vlm_modulated, 
@@ -132,7 +134,9 @@ class VLA(nnx.Module):
                     cond_drop_prob=cond_drop_prob,
                     rngs=rngs
                 )
-                pred_v_raw = self.action_unembed(dit_out)
+                processed_obs = dit_out_full[:, 0, :]
+                dit_out = dit_out_full[:, 1:, :]
+                pred_v_raw = self.action_unembed(dit_out, processed_obs)
                 return pred_v_raw
             
         # Inference / Generation Mode (Continuous Flow Matching Euler steps)
@@ -158,7 +162,7 @@ class VLA(nnx.Module):
                 
                 action_proj = self.action_projector(x_t)
                 
-                v_pred_proj = inference_cfg(
+                v_pred_proj_full = inference_cfg(
                     model=self.dit,
                     x=action_proj, 
                     obs_emb=obs_emb, 
@@ -170,7 +174,10 @@ class VLA(nnx.Module):
                     mask=None
                 )
                 
-                v_pred_raw = self.action_unembed(v_pred_proj)
+                processed_obs = v_pred_proj_full[:, 0, :]
+                v_pred_proj = v_pred_proj_full[:, 1:, :]
+                
+                v_pred_raw = self.action_unembed(v_pred_proj, processed_obs)
                 
                 x_t = x_t + v_pred_raw * dt
                 
