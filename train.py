@@ -423,7 +423,14 @@ def main():
             
             for step, batch in enumerate(train_loader):
                 t0 = time.time()
-            
+                if 'vlm_out' not in batch:
+                    raise ValueError(
+                        f"\n\n[ERROR] Missing 'vlm_out' in batch!\n"
+                        f"This means VideoDataset couldn't find the precomputed .npz files at: {config.precompute_path}\n"
+                        f"Because the embeddings were missing, the dataset fell back to searching for images.\n"
+                        f"Please ensure your --precompute_path is correct and the files exist!\n"
+                    )
+                    
                 vlm_out_jnp = torch_to_jax(batch['vlm_out'])
                 observation_jnp = torch_to_jax(batch['observation_state'])
                 action_jnp = torch_to_jax(batch['action'])
