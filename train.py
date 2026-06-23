@@ -133,7 +133,7 @@ def setup_dataloader(config):
     return train_loader, val_loader, test_loader, obs_dim, action_dim
 
 
-def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
+def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon, lambda_temporal):
     # 1. Action is already in raw space: (B, H, A)
     x_1 = action
     
@@ -147,7 +147,7 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     # 4. Target Velocity in raw space
     target_v = x_1 - x_0
     
-    pred_v_raw, all_attns, vlm_modulated, obs_emb, action_proj = model(
+    outputs = model(
         images=None, 
         input_ids=None, 
         observation=observation, 
@@ -156,6 +156,11 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
         vlm_out=vlm_out,
         return_attn=True
     )
+    pred_v_raw = outputs["pred_v_raw"]
+    all_attns = outputs["all_attns"]
+    vlm_modulated = outputs["vlm_modulated"]
+    obs_emb = outputs["obs_emb"]
+    action_proj = outputs["action_proj"]
     
     # 5. MSE Loss on raw velocity
     fm_loss = jnp.mean((pred_v_raw - target_v) ** 2)
@@ -165,14 +170,21 @@ def loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon):
     action_recon = model.action_unembed(action_proj, obs_emb)
     recon_loss = jnp.mean(optax.huber_loss(action_recon, action, delta=1.0))
     
-    loss_val = fm_loss + lambda_recon * recon_loss
-    return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss, vlm_modulated, obs_emb, action_proj, all_attns)
+    # 7. Temporal Consistency Loss
+    # Reconstruct predicted action x_1
+    pred_x_1 = x_t + (1.0 - t_exp) * pred_v_raw
+    diff_pred = pred_x_1[:, 1:, :] - pred_x_1[:, :-1, :]
+    diff_gt = action[:, 1:, :] - action[:, :-1, :]
+    temporal_loss = jnp.mean((diff_pred - diff_gt) ** 2)
+    
+    loss_val = fm_loss + lambda_recon * recon_loss + lambda_temporal * temporal_loss
+    return loss_val, (pred_v_raw, target_v, x_t, fm_loss, recon_loss, temporal_loss, vlm_modulated, obs_emb, action_proj, all_attns)
 
 
 @nnx.jit
-def train_step(model, optimizer, vlm_out, observation, action, t, noise_key, lambda_recon):
+def train_step(model, optimizer, vlm_out, observation, action, t, noise_key, lambda_recon, lambda_temporal):
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss_val, aux), grads = grad_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon)
+    (loss_val, aux), grads = grad_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon, lambda_temporal)
     optimizer.update(model, grads)
     
     grad_norm = optax.global_norm(grads)
@@ -189,13 +201,13 @@ def train_step(model, optimizer, vlm_out, observation, action, t, noise_key, lam
 
 
 @nnx.jit
-def eval_step(model, vlm_out, observation, action, t, noise_key, lambda_recon):
-    loss_val, aux = loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon)
+def eval_step(model, vlm_out, observation, action, t, noise_key, lambda_recon, lambda_temporal):
+    loss_val, aux = loss_fn(model, vlm_out, observation, action, t, noise_key, lambda_recon, lambda_temporal)
     return loss_val, aux
 
 @nnx.jit
 def val_generate_step(model, vlm_out, observation, noise_key):
-    pred_action = model(
+    outputs = model(
         images=None, 
         input_ids=None, 
         observation=observation, 
@@ -203,7 +215,126 @@ def val_generate_step(model, vlm_out, observation, noise_key):
         vlm_out=vlm_out,
         key=noise_key
     )
-    return pred_action
+    return outputs["pred_action"]
+
+
+def log_train_metrics(
+    console, pred_v_raw, target_v_raw, fm_loss, recon_loss, temporal_loss,
+    vlm_modulated, obs_emb, action_proj, all_attns,
+    loss_val, grad_norm, comp_grad_norms,
+    epoch, global_step, step, lr
+):
+    # Shape: (action_dim,) — tells you WHICH joints are mispredicted
+    per_dim_bias = jnp.mean(pred_v_raw - target_v_raw, axis=(0, 1))  # (A,)
+    per_dim_mae  = jnp.mean(jnp.abs(pred_v_raw - target_v_raw), axis=(0, 1))
+    per_dim_target_abs_mean = jnp.mean(jnp.abs(target_v_raw), axis=(0, 1)) + 1e-8
+
+    max_relative_mae = jnp.max(per_dim_mae / per_dim_target_abs_mean)
+    max_relative_bias = jnp.max(jnp.abs(per_dim_bias) / per_dim_target_abs_mean)
+    
+    pred_mean = jnp.mean(pred_v_raw)
+    target_mean = jnp.mean(target_v_raw)
+    cov = jnp.mean((pred_v_raw - pred_mean) * (target_v_raw - target_mean))
+    correlation = cov / (jnp.std(pred_v_raw) * jnp.std(target_v_raw) + 1e-8)
+
+    log_dict = {
+        "train/loss": float(loss_val),
+        "train/recon_loss": float(recon_loss),
+        "train/temporal_loss": float(temporal_loss),
+        "train/grad_norm": float(grad_norm),
+        "train/max_relative_bias": float(max_relative_bias),
+        "train/correlation": float(correlation),
+        "train/max_relative_mae": float(max_relative_mae),
+        "epoch": epoch + 1,
+        "train/lr": float(lr)
+    }
+    
+    # Add modulator output mean and std
+    mod_mean = jnp.mean(vlm_modulated)
+    mod_std = jnp.std(vlm_modulated)
+    log_dict["ob_projector/mod_out_mean"] = float(mod_mean)
+    log_dict["ob_projector/mod_out_std"] = float(mod_std)
+    
+    # Add observation embedding mean and std
+    obs_mean = jnp.mean(obs_emb)
+    obs_std = jnp.std(obs_emb)
+    log_dict["ob_projector/obs_emb_mean"] = float(obs_mean)
+    log_dict["ob_projector/obs_emb_std"] = float(obs_std)
+    
+    # Add action embedding mean and std
+    act_mean = jnp.mean(action_proj)
+    act_std = jnp.std(action_proj)
+    log_dict["ob_projector/action_emb_mean"] = float(act_mean)
+    log_dict["ob_projector/action_emb_std"] = float(act_std)
+    
+    if step % 50 == 0:
+        console.print(f"[dim]Modulator Output | Mean: {mod_mean:.4f} | Std: {mod_std:.4f}[/dim]")
+        
+        # Generate and log attention heatmap for all blocks
+        try:
+            num_blocks = len(all_attns)
+            fig, axes = plt.subplots(2, num_blocks, figsize=(6 * num_blocks, 12), squeeze=False)
+                
+            for i, (sa_attn, ca_attn) in enumerate(all_attns):
+                # Self attention
+                sa_matrix = sa_attn[-1]  # Last element in the batch
+                sa_matrix_mean = jnp.mean(sa_matrix, axis=0)  # Average across heads
+                sa_matrix_np = np.array(sa_matrix_mean)
+                
+                sns.heatmap(sa_matrix_np, ax=axes[0, i], cmap="viridis")
+                axes[0, i].set_title(f"Self-Attn Block {i}")
+                
+                # Cross attention
+                ca_matrix = ca_attn[-1]
+                ca_matrix_mean = jnp.mean(ca_matrix, axis=0)
+                ca_matrix_np = np.array(ca_matrix_mean)
+                
+                sns.heatmap(ca_matrix_np, ax=axes[1, i], cmap="viridis")
+                axes[1, i].set_title(f"Cross-Attn Block {i}")
+                
+            fig.suptitle(f"Step {global_step} Attention Heatmaps (Batch Element -1)", fontsize=16)
+            plt.tight_layout()
+            log_dict["ob_projector/attention_heatmap"] = wandb.Image(fig)
+            plt.close(fig)
+        except Exception as e:
+            console.print(f"[red]Failed to generate heatmap: {e}[/red]")
+    
+    for comp_name, norm_val in comp_grad_norms.items():
+        log_dict[f"grad/{comp_name}"] = float(norm_val)
+    
+    wandb.log(log_dict, step=global_step)
+    
+    if step % 100 == 0:
+        console.print(f"[dim]Step {global_step} | Loss: {float(loss_val):.4f} (FM: {float(fm_loss):.4f}, Recon: {float(recon_loss):.4f}) | Grad: {float(grad_norm):.3f}[/dim]")
+
+
+def log_val_metrics(
+    console, val_losses, val_recon_losses, val_temporal_losses,
+    val_correlations, val_max_relative_biases, val_max_relative_maes,
+    val_action_mses, global_step, epoch
+):
+    if not val_losses:
+        return
+        
+    mean_val_loss = float(np.mean(val_losses))
+    mean_val_recon_loss = float(np.mean(val_recon_losses))
+    mean_val_temporal_loss = float(np.mean(val_temporal_losses))
+    mean_val_correlation = float(np.mean(val_correlations))
+    mean_val_max_relative_bias = float(np.mean(val_max_relative_biases))
+    mean_val_max_relative_mae = float(np.mean(val_max_relative_maes))
+    mean_val_action_mse = float(np.mean(val_action_mses))
+    
+    console.print(f"[bold magenta]Step {global_step} - Val Loss: {mean_val_loss:.4f} | Action MSE: {mean_val_action_mse:.4f} | Recon: {mean_val_recon_loss:.4f}[/bold magenta]\n")
+    wandb.log({
+        "val/loss": mean_val_loss,
+        "val/recon_loss": mean_val_recon_loss,
+        "val/temporal_loss": mean_val_temporal_loss,
+        "val/action_mse": mean_val_action_mse,
+        "val/correlation": mean_val_correlation,
+        "val/max_relative_bias": mean_val_max_relative_bias,
+        "val/max_relative_mae": mean_val_max_relative_mae,
+        "epoch": epoch + 1
+    }, step=global_step)
 
 
 def main():
@@ -282,10 +413,10 @@ def main():
                 t = jax.device_put(t, batch_sharding)
                 t3 = time.time()
                 
-                loss_val, aux, grad_norm, comp_grad_norms = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key, config.lambda_recon)
+                loss_val, aux, grad_norm, comp_grad_norms = train_step(vla, optimizer, vlm_out_jnp, observation_jnp, action_jnp, t, noise_key, config.lambda_recon, config.lambda_temporal)
                 
                 t4 = time.time()
-                pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss, vlm_modulated, obs_emb, action_proj, all_attns = aux
+                pred_v_raw, target_v_raw, x_t, fm_loss, recon_loss, temporal_loss, vlm_modulated, obs_emb, action_proj, all_attns = aux
                 
                 loss_val = jax.block_until_ready(loss_val)
                 t5 = time.time()
@@ -293,87 +424,14 @@ def main():
                 if step < 5 or step % 50 == 0:
                     console.print(f"[bold cyan]Step {step}[/bold cyan] [dim]Profiling | Prep: {t1-t0:.4f}s | VLM: {t2-t1:.4f}s | DevicePut: {t3-t2:.4f}s | JIT Execute: {t5-t3:.4f}s[/dim]")
                 
-                # Shape: (action_dim,) — tells you WHICH joints are mispredicted
-                per_dim_bias = jnp.mean(pred_v_raw - target_v_raw, axis=(0, 1))  # (A,)
-                per_dim_mae  = jnp.mean(jnp.abs(pred_v_raw - target_v_raw), axis=(0, 1))
-                per_dim_target_abs_mean = jnp.mean(jnp.abs(target_v_raw), axis=(0, 1)) + 1e-8
-
-                max_relative_mae = jnp.max(per_dim_mae / per_dim_target_abs_mean)
-                max_relative_bias = jnp.max(jnp.abs(per_dim_bias) / per_dim_target_abs_mean)
-                
-                pred_mean = jnp.mean(pred_v_raw)
-                target_mean = jnp.mean(target_v_raw)
-                cov = jnp.mean((pred_v_raw - pred_mean) * (target_v_raw - target_mean))
-                correlation = cov / (jnp.std(pred_v_raw) * jnp.std(target_v_raw) + 1e-8)
-
-                log_dict = {
-                    "train/loss": float(loss_val),
-                    "train/recon_loss": float(recon_loss),
-                    "train/grad_norm": float(grad_norm),
-                    "train/max_relative_bias": float(max_relative_bias),
-                    "train/correlation": float(correlation),
-                    "train/max_relative_mae": float(max_relative_mae),
-                    "epoch": epoch + 1,
-                    "train/lr": float(schedule(global_step))
-                }
-                
-                # Add modulator output mean and std
-                mod_mean = jnp.mean(vlm_modulated)
-                mod_std = jnp.std(vlm_modulated)
-                log_dict["ob_projector/mod_out_mean"] = float(mod_mean)
-                log_dict["ob_projector/mod_out_std"] = float(mod_std)
-                
-                # Add observation embedding mean and std
-                obs_mean = jnp.mean(obs_emb)
-                obs_std = jnp.std(obs_emb)
-                log_dict["ob_projector/obs_emb_mean"] = float(obs_mean)
-                log_dict["ob_projector/obs_emb_std"] = float(obs_std)
-                
-                # Add action embedding mean and std
-                act_mean = jnp.mean(action_proj)
-                act_std = jnp.std(action_proj)
-                log_dict["ob_projector/action_emb_mean"] = float(act_mean)
-                log_dict["ob_projector/action_emb_std"] = float(act_std)
-                
-                if step % 50 == 0:
-                    console.print(f"[dim]Modulator Output | Mean: {mod_mean:.4f} | Std: {mod_std:.4f}[/dim]")
-                    
-                    # Generate and log attention heatmap for all blocks
-                    try:
-                        num_blocks = len(all_attns)
-                        fig, axes = plt.subplots(2, num_blocks, figsize=(6 * num_blocks, 12), squeeze=False)
-                            
-                        for i, (sa_attn, ca_attn) in enumerate(all_attns):
-                            # Self attention
-                            sa_matrix = sa_attn[-1]  # Last element in the batch
-                            sa_matrix_mean = jnp.mean(sa_matrix, axis=0)  # Average across heads
-                            sa_matrix_np = np.array(sa_matrix_mean)
-                            
-                            sns.heatmap(sa_matrix_np, ax=axes[0, i], cmap="viridis")
-                            axes[0, i].set_title(f"Self-Attn Block {i}")
-                            
-                            # Cross attention
-                            ca_matrix = ca_attn[-1]
-                            ca_matrix_mean = jnp.mean(ca_matrix, axis=0)
-                            ca_matrix_np = np.array(ca_matrix_mean)
-                            
-                            sns.heatmap(ca_matrix_np, ax=axes[1, i], cmap="viridis")
-                            axes[1, i].set_title(f"Cross-Attn Block {i}")
-                            
-                        fig.suptitle(f"Step {global_step} Attention Heatmaps (Batch Element -1)", fontsize=16)
-                        plt.tight_layout()
-                        log_dict["ob_projector/attention_heatmap"] = wandb.Image(fig)
-                        plt.close(fig)
-                    except Exception as e:
-                        console.print(f"[red]Failed to generate heatmap: {e}[/red]")
-                
-                for comp_name, norm_val in comp_grad_norms.items():
-                    log_dict[f"grad/{comp_name}"] = float(norm_val)
-                
-                wandb.log(log_dict, step=global_step)
-                
-                if step % 100 == 0:
-                    console.print(f"[dim]Step {global_step} | Loss: {float(loss_val):.4f} (FM: {float(fm_loss):.4f}, Recon: {float(recon_loss):.4f}) | Grad: {float(grad_norm):.3f}[/dim]")
+                log_train_metrics(
+                    console=console,
+                    pred_v_raw=pred_v_raw, target_v_raw=target_v_raw,
+                    fm_loss=fm_loss, recon_loss=recon_loss, temporal_loss=temporal_loss,
+                    vlm_modulated=vlm_modulated, obs_emb=obs_emb, action_proj=action_proj, all_attns=all_attns,
+                    loss_val=loss_val, grad_norm=grad_norm, comp_grad_norms=comp_grad_norms,
+                    epoch=epoch, global_step=global_step, step=step, lr=schedule(global_step)
+                )
                 
                 if global_step % config.save_every == 0 and global_step > 0:
                     console.print(f"\n[bold yellow]Step {global_step}: Saving Checkpoint...[/bold yellow]")
@@ -394,6 +452,7 @@ def main():
                     val_losses = []
                     val_fm_losses = []
                     val_recon_losses = []
+                    val_temporal_losses = []
                     val_correlations = []
                     val_max_relative_biases = []
                     val_max_relative_maes = []
@@ -421,15 +480,16 @@ def main():
                         if global_step == 100 and val_idx == 0:
                             console.print("[bold cyan]Note: JAX is compiling the validation step for the first time. This may take 3-5 minutes...[/bold cyan]")
                             
-                        val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key, config.lambda_recon)
+                        val_loss_val, val_aux = eval_step(vla, val_vlm_out_jnp, val_observation_jnp, val_action_jnp, val_t, val_noise_key, config.lambda_recon, config.lambda_temporal)
                         val_pred_action = val_generate_step(vla, val_vlm_out_jnp, val_observation_jnp, val_noise_key)
                         
                         val_loss_val = jax.block_until_ready(val_loss_val)
                         val_pred_action = jax.block_until_ready(val_pred_action)
                         
                         val_losses.append(float(val_loss_val))
-                        val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss, val_vlm_modulated, val_obs_emb, val_action_proj, val_all_attns = val_aux
+                        val_pred_v_raw, val_target_v_raw, _, val_fm_loss, val_recon_loss, val_temporal_loss, val_vlm_modulated, val_obs_emb, val_action_proj, val_all_attns = val_aux
                         val_recon_losses.append(float(val_recon_loss))
+                        val_temporal_losses.append(float(val_temporal_loss))
                         
                         # Multi-step integrated metrics
                         val_action_mse = jnp.mean((val_pred_action - val_action_jnp) ** 2)
@@ -453,23 +513,18 @@ def main():
                         val_max_relative_biases.append(float(val_max_relative_bias))
                         val_max_relative_maes.append(float(val_max_relative_mae))
                     
-                    if val_losses:
-                        mean_val_loss = float(np.mean(val_losses))
-                        mean_val_recon_loss = float(np.mean(val_recon_losses))
-                        mean_val_correlation = float(np.mean(val_correlations))
-                        mean_val_max_relative_bias = float(np.mean(val_max_relative_biases))
-                        mean_val_max_relative_mae = float(np.mean(val_max_relative_maes))
-                        mean_val_action_mse = float(np.mean(val_action_mses))
-                        
-                        console.print(f"[bold magenta]Step {global_step} - Val Loss: {mean_val_loss:.4f} | Action MSE: {mean_val_action_mse:.4f} | Recon: {mean_val_recon_loss:.4f}[/bold magenta]\n")
-                        wandb.log({
-                            "val/loss": mean_val_loss,
-                            "val/recon_loss": mean_val_recon_loss,
-                            "val/action_mse": mean_val_action_mse,
-                            "val/correlation": mean_val_correlation,
-                            "val/max_relative_bias": mean_val_max_relative_bias,
-                            "val/max_relative_mae": mean_val_max_relative_mae,
-                        }, step=global_step)
+                    log_val_metrics(
+                        console=console,
+                        val_losses=val_losses,
+                        val_recon_losses=val_recon_losses,
+                        val_temporal_losses=val_temporal_losses,
+                        val_correlations=val_correlations,
+                        val_max_relative_biases=val_max_relative_biases,
+                        val_max_relative_maes=val_max_relative_maes,
+                        val_action_mses=val_action_mses,
+                        global_step=global_step,
+                        epoch=epoch
+                    )
                     
                 global_step += 1
 

@@ -11,6 +11,7 @@ class TrainConfig:
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
     lambda_recon: float = 0.05
+    lambda_temporal: float = 0.05
     wandb_project: str = "nanoVLA"
     num_epochs: int = 30
     save_every: int = 100
@@ -42,6 +43,8 @@ def parse_args() -> TrainConfig:
                         help=f"Weight decay (default: {default_config.weight_decay})")
     parser.add_argument("--lambda_recon", type=float, default=default_config.lambda_recon,
                         help=f"Reconstruction loss weight (default: {default_config.lambda_recon})")
+    parser.add_argument("--lambda_temporal", type=float, default=default_config.lambda_temporal,
+                        help=f"Temporal consistency loss weight (default: {default_config.lambda_temporal})")
     
     parser.add_argument("--wandb_project", type=str, default=default_config.wandb_project,
                         help=f"W&B project name (default: {default_config.wandb_project})")

@@ -184,9 +184,12 @@ class CrossAttention(nnx.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         
-        self.q = nnx.Linear(dim, dim, rngs=rngs)
-        self.kv = nnx.Linear(context_dim, dim * 2, rngs=rngs)
-        self.out = nnx.Linear(dim, dim, rngs=rngs)
+        self.q = nnx.Linear(dim, dim, rngs=rngs, 
+                     kernel_init=nnx.initializers.normal(0.02))
+        self.kv = nnx.Linear(context_dim, dim * 2, rngs=rngs,
+                     kernel_init=nnx.initializers.normal(0.02))
+        self.out = nnx.Linear(dim, dim, rngs=rngs,
+                      kernel_init=nnx.initializers.zeros_init())  # output zero-init
         
     def __call__(self, x, context, mask=None, return_attn=False):
         B, L, D = x.shape
@@ -373,8 +376,8 @@ class DiT(nnx.Module):
         x = self.final_norm(x)
         
         if return_attn:
-            return x, all_attns
-        return x
+            return {"x": x, "all_attns": all_attns}
+        return {"x": x}
 
 
 # ==========================================
@@ -383,10 +386,12 @@ class DiT(nnx.Module):
 
 def inference_cfg(model: DiT, x, obs_emb, context, t, cfg_scale=1.0, cos=None, sin=None, mask=None, context_mask=None):
     """Combines predictions using classifier-free guidance."""
-    eps_cond = model(x, obs_emb, context, t, cos=cos, sin=sin, mask=mask, context_mask=context_mask)
+    out_cond = model(x, obs_emb, context, t, cos=cos, sin=sin, mask=mask, context_mask=context_mask)
+    eps_cond = out_cond["x"]
     
     null_ctx = jnp.broadcast_to(model.null_context[...], context.shape)
-    eps_uncond = model(x, obs_emb, null_ctx, t, cos=cos, sin=sin, mask=mask, context_mask=context_mask)
+    out_uncond = model(x, obs_emb, null_ctx, t, cos=cos, sin=sin, mask=mask, context_mask=context_mask)
+    eps_uncond = out_uncond["x"]
     
     return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
 
@@ -460,14 +465,14 @@ if __name__ == "__main__":
     
     print("Testing conditional predict...")
     out_cond = dit_model(x_dit, None, context, t, cos=cos, sin=sin)
-    print(f"Output cond shape:   {out_cond.shape}")
-    assert out_cond.shape == x_dit.shape
+    print(f"Output cond shape:   {out_cond['x'].shape}")
+    assert out_cond['x'].shape == x_dit.shape
     
     print("Testing unconditional predict...")
     null_ctx = jnp.broadcast_to(dit_model.null_context[...], context.shape)
     out_uncond = dit_model(x_dit, None, null_ctx, t, cos=cos, sin=sin)
-    print(f"Output uncond shape: {out_uncond.shape}")
-    assert out_uncond.shape == x_dit.shape
+    print(f"Output uncond shape: {out_uncond['x'].shape}")
+    assert out_uncond['x'].shape == x_dit.shape
     
     print("Testing CFG inference...")
     out_cfg = inference_cfg(dit_model, x_dit, None, context, t, cfg_scale=4.5, cos=cos, sin=sin)
@@ -475,6 +480,6 @@ if __name__ == "__main__":
     
     print("Testing training forward with dropout...")
     out_train = dit_model(x_dit, None, context, t, cos=cos, sin=sin, cond_drop_prob=0.5, rngs=rngs)
-    assert out_train.shape == x_dit.shape
+    assert out_train['x'].shape == x_dit.shape
     
     print("DiT Test passed successfully!")

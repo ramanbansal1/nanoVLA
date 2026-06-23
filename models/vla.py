@@ -106,7 +106,7 @@ class VLA(nnx.Module):
                 t = jnp.ones((B,))
 
             if return_attn:
-                dit_out_full, all_attns = self.dit(
+                dit_out_dict = self.dit(
                     x=action_proj, 
                     obs_emb=obs_emb, 
                     context=vlm_modulated, 
@@ -118,12 +118,20 @@ class VLA(nnx.Module):
                     rngs=rngs,
                     return_attn=True
                 )
+                dit_out_full = dit_out_dict["x"]
+                all_attns = dit_out_dict["all_attns"]
                 processed_obs = dit_out_full[:, 0, :]
                 dit_out = dit_out_full[:, 1:, :]
                 pred_v_raw = self.action_unembed(dit_out, processed_obs)
-                return pred_v_raw, all_attns, vlm_modulated, obs_emb, action_proj
+                return {
+                    "pred_v_raw": pred_v_raw,
+                    "all_attns": all_attns,
+                    "vlm_modulated": vlm_modulated,
+                    "obs_emb": obs_emb,
+                    "action_proj": action_proj
+                }
             else:
-                dit_out_full = self.dit(
+                dit_out_dict = self.dit(
                     x=action_proj, 
                     obs_emb=obs_emb, 
                     context=vlm_modulated, 
@@ -134,10 +142,11 @@ class VLA(nnx.Module):
                     cond_drop_prob=cond_drop_prob,
                     rngs=rngs
                 )
+                dit_out_full = dit_out_dict["x"]
                 processed_obs = dit_out_full[:, 0, :]
                 dit_out = dit_out_full[:, 1:, :]
                 pred_v_raw = self.action_unembed(dit_out, processed_obs)
-                return pred_v_raw
+                return {"pred_v_raw": pred_v_raw}
             
         # Inference / Generation Mode (Continuous Flow Matching Euler steps)
         else:
@@ -181,4 +190,4 @@ class VLA(nnx.Module):
                 
                 x_t = x_t + v_pred_raw * dt
                 
-            return x_t
+            return {"pred_action": x_t}
