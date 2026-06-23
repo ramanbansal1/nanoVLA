@@ -42,8 +42,7 @@ def main():
     # Save the target path before we disable it for the dataloader
     target_precompute_path = config.precompute_path
     
-    # Disable precomputed npz loading to force online image loading
-    config.precompute_path = None
+    # Do NOT disable precomputed npz loading, so it skips loading images if available!
     
     console.print("[bold cyan]Setting up dataloader...[/bold cyan]")
     
@@ -62,7 +61,7 @@ def main():
         dataset=full_hf_dataset,
         datasets_root=config.datasets_root,
         action_horizon=config.action_horizon,
-        precompute_path=None,
+        precompute_path=target_precompute_path,
     )
     
     seq_loader = DataLoader(
@@ -129,6 +128,11 @@ def main():
         import numpy as np
         
         # Online compute
+        if "image" not in batch or batch["image"].sum() == 0:
+            # Batch is fully precomputed or missing images, skip online compute
+            pbar.update(1)
+            continue
+            
         images = batch["image"].numpy()  # (B, H, W, C)
         input_ids = batch["input_ids"].numpy()
         

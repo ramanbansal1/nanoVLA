@@ -32,19 +32,48 @@ from models.vla import VLA
 def custom_collate_fn(batch):
     collated = {}
 
-    for key in batch[0].keys():
+    keys = set()
+    for item in batch:
+        keys.update(item.keys())
+
+    for key in keys:
         if key == "images":
             imgs = []
             for item in batch:
-                first_cam = sorted(item["images"].keys())[0]
-                imgs.append(np.array(item["images"][first_cam], copy=True))
+                if "images" in item and len(item["images"]) > 0:
+                    first_cam = sorted(item["images"].keys())[0]
+                    imgs.append(np.array(item["images"][first_cam], copy=True))
+                else:
+                    imgs.append(np.zeros((224, 224, 3), dtype=np.uint8))
             collated["image"] = default_collate(imgs)
         elif key == "input_ids":
-            collated[key] = default_collate([np.array(item[key], copy=True) for item in batch])
+            vals = []
+            for item in batch:
+                if "input_ids" in item:
+                    vals.append(np.array(item["input_ids"], copy=True))
+                else:
+                    vals.append(np.zeros((64,), dtype=np.int32))
+            collated[key] = default_collate(vals)
         elif key == "vlm_out":
-            collated[key] = default_collate([np.array(item[key], copy=True) for item in batch])
-        elif key != "images":
-            collated[key] = default_collate([item[key] for item in batch])
+            vals = []
+            for item in batch:
+                if "vlm_out" in item:
+                    vals.append(np.array(item["vlm_out"], copy=True))
+                else:
+                    vals.append(np.zeros((256 + 64, 768), dtype=np.float32))
+            collated[key] = default_collate(vals)
+        else:
+            vals = []
+            for item in batch:
+                if key in item:
+                    vals.append(item[key])
+                else:
+                    # Provide a dummy value of the same type as the first available
+                    for ref_item in batch:
+                        if key in ref_item:
+                            vals.append(ref_item[key])
+                            break
+            collated[key] = default_collate(vals)
 
     return collated
 
