@@ -142,7 +142,8 @@ def setup_dataloader(config):
             batch_size=config.batch_size, 
             shuffle=is_train, 
             pin_memory=False,
-            num_workers=config.num_workers if is_train else 0,
+            num_workers=0,
+            persistent_workers=False,
             collate_fn=custom_collate_fn,
             drop_last=True
         )
