@@ -189,7 +189,7 @@ class CrossAttention(nnx.Module):
         self.kv = nnx.Linear(context_dim, dim * 2, rngs=rngs,
                      kernel_init=nnx.initializers.normal(0.02))
         self.out = nnx.Linear(dim, dim, rngs=rngs,
-                      kernel_init=nnx.initializers.zeros_init())  # output zero-init
+                      kernel_init=nnx.initializers.normal(0.02))
         
     def __call__(self, x, context, mask=None, return_attn=False):
         B, L, D = x.shape
